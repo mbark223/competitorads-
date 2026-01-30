@@ -2081,10 +2081,43 @@
 
       document.getElementById('adModalTitle').textContent = currentAd.headline || 'Ad Details';
 
-      // Handle thumbnail display - show placeholder for video ads without thumbnails
+      // Handle thumbnail/video display
       const thumbnailUrl = getAdThumbnailUrl(currentAd);
+      const videoUrl = currentAd.video_url;
+      const hasVideo = videoUrl && isVideoUrl(videoUrl);
       const imageContainer = document.getElementById('adModalImageContainer');
-      if (thumbnailUrl) {
+      
+      if (hasVideo) {
+        // Video ad with playback capability
+        imageContainer.innerHTML = `
+          <div class="relative w-full h-full">
+            <!-- Thumbnail container -->
+            <div id="modalThumbnailContainer" class="w-full h-full">
+              ${thumbnailUrl 
+                ? `<img src="${thumbnailUrl}" alt="Ad creative" class="w-full h-full object-cover">`
+                : `<div class="w-full h-full flex flex-col items-center justify-center bg-[#e4e6eb]">
+                    <svg class="w-20 h-20 text-[#65676b] mb-3" fill="currentColor" viewBox="0 0 24 24">
+                      <path d="M8 5v14l11-7z"/>
+                    </svg>
+                    <span class="text-[#65676b]">Video Ad</span>
+                  </div>`
+              }
+            </div>
+            <!-- Video container (hidden by default) -->
+            <div id="modalVideoContainer" class="hidden w-full h-full absolute inset-0">
+              <video id="modalVideo" class="w-full h-full object-cover" src="${videoUrl}" playsinline></video>
+            </div>
+            <!-- Play/Pause button overlay -->
+            <button id="modalPlayBtn" onclick="toggleModalVideo(event)" class="absolute inset-0 flex items-center justify-center group z-10">
+              <div class="w-16 h-16 rounded-full bg-white/90 flex items-center justify-center shadow-lg group-hover:scale-110 transition-transform">
+                <svg class="w-7 h-7 text-[#1877f2] ml-1" fill="currentColor" viewBox="0 0 24 24">
+                  <path d="M8 5v14l11-7z"/>
+                </svg>
+              </div>
+            </button>
+          </div>
+        `;
+      } else if (thumbnailUrl) {
         imageContainer.innerHTML = `<img id="adModalImage" src="${thumbnailUrl}" alt="Ad creative" class="w-full h-full object-cover">`;
       } else {
         imageContainer.innerHTML = `
@@ -2137,9 +2170,93 @@
     }
 
     function closeAdModal() {
+      // Stop modal video if playing
+      const modalVideo = document.getElementById('modalVideo');
+      if (modalVideo) modalVideo.pause();
+      
       document.getElementById('adModal').classList.add('hidden');
       document.body.style.overflow = '';
       currentAd = null;
+    }
+
+    function toggleModalVideo(event) {
+      event.preventDefault();
+      event.stopPropagation();
+      
+      const thumbnailContainer = document.getElementById('modalThumbnailContainer');
+      const videoContainer = document.getElementById('modalVideoContainer');
+      const playBtn = document.getElementById('modalPlayBtn');
+      const video = document.getElementById('modalVideo');
+      
+      if (!video || !videoContainer) return;
+      
+      const isPlaying = !videoContainer.classList.contains('hidden');
+      
+      // Also pause any card video that might be playing
+      if (currentlyPlayingCard) {
+        const prevCard = document.getElementById(currentlyPlayingCard);
+        if (prevCard) {
+          const prevVideo = prevCard.querySelector('video');
+          if (prevVideo) prevVideo.pause();
+          const prevVideoContainer = prevCard.querySelector('.video-container');
+          if (prevVideoContainer) prevVideoContainer.classList.add('hidden');
+          const prevThumbnail = prevCard.querySelector('.ad-thumbnail-container');
+          if (prevThumbnail) prevThumbnail.classList.remove('hidden');
+          const prevPlayBtn = prevCard.querySelector('.play-video-btn');
+          if (prevPlayBtn) {
+            prevPlayBtn.classList.remove('hidden');
+            prevPlayBtn.innerHTML = `
+              <div class="w-14 h-14 rounded-full bg-white/90 flex items-center justify-center shadow-lg group-hover:scale-110 transition-transform">
+                <svg class="w-6 h-6 text-[#1877f2] ml-1" fill="currentColor" viewBox="0 0 24 24">
+                  <path d="M8 5v14l11-7z"/>
+                </svg>
+              </div>
+            `;
+          }
+        }
+        currentlyPlayingCard = null;
+      }
+      
+      if (isPlaying) {
+        // Pause and show thumbnail
+        video.pause();
+        videoContainer.classList.add('hidden');
+        thumbnailContainer.classList.remove('hidden');
+        playBtn.innerHTML = `
+          <div class="w-16 h-16 rounded-full bg-white/90 flex items-center justify-center shadow-lg group-hover:scale-110 transition-transform">
+            <svg class="w-7 h-7 text-[#1877f2] ml-1" fill="currentColor" viewBox="0 0 24 24">
+              <path d="M8 5v14l11-7z"/>
+            </svg>
+          </div>
+        `;
+      } else {
+        // Play video
+        thumbnailContainer.classList.add('hidden');
+        videoContainer.classList.remove('hidden');
+        video.play();
+        
+        // Change to pause button
+        playBtn.innerHTML = `
+          <div class="w-16 h-16 rounded-full bg-white/90 flex items-center justify-center shadow-lg group-hover:scale-110 transition-transform">
+            <svg class="w-7 h-7 text-[#1877f2]" fill="currentColor" viewBox="0 0 24 24">
+              <path d="M6 4h4v16H6V4zm8 0h4v16h-4V4z"/>
+            </svg>
+          </div>
+        `;
+        
+        // Reset when video ends
+        video.onended = () => {
+          videoContainer.classList.add('hidden');
+          thumbnailContainer.classList.remove('hidden');
+          playBtn.innerHTML = `
+            <div class="w-16 h-16 rounded-full bg-white/90 flex items-center justify-center shadow-lg group-hover:scale-110 transition-transform">
+              <svg class="w-7 h-7 text-[#1877f2] ml-1" fill="currentColor" viewBox="0 0 24 24">
+                <path d="M8 5v14l11-7z"/>
+              </svg>
+            </div>
+          `;
+        };
+      }
     }
 
     async function analyzeAd() {
