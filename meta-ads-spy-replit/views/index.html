@@ -716,11 +716,36 @@
         </button>
       </div>
 
+      <!-- Bulk Actions Bar (hidden by default) -->
+      <div id="bulkActionsBar" class="hidden glass-card p-3 mb-4 flex items-center justify-between bg-[#e7f3ff] border-[#1877f2]">
+        <div class="flex items-center gap-3">
+          <span id="selectedBrandsCount" class="text-sm font-medium text-[#1877f2]">0 brands selected</span>
+          <button onclick="clearBrandSelection()" class="text-sm text-[#65676b] hover:text-[#1c1e21] underline">Clear selection</button>
+        </div>
+        <div class="flex items-center gap-2">
+          <button onclick="scrapeSelectedBrands()" class="btn-primary px-4 py-2 rounded-lg text-sm font-medium flex items-center gap-2">
+            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/>
+            </svg>
+            Scrape Selected
+          </button>
+          <button onclick="deleteSelectedBrands()" class="px-4 py-2 rounded-lg text-sm font-medium flex items-center gap-2 bg-[#fee2e2] text-[#dc2626] hover:bg-[#fecaca] transition-colors">
+            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/>
+            </svg>
+            Delete Selected
+          </button>
+        </div>
+      </div>
+
       <!-- Brands Table -->
       <div class="glass-card overflow-hidden">
         <table class="w-full">
           <thead class="bg-[#f0f2f5]">
             <tr>
+              <th class="text-left px-4 py-3 w-10">
+                <input type="checkbox" id="selectAllBrandsCheckbox" onchange="toggleSelectAllBrands()" class="w-4 h-4 rounded border-[#dddfe2] text-[#1877f2] focus:ring-[#1877f2] cursor-pointer">
+              </th>
               <th class="text-left px-4 py-3 text-sm font-medium text-[#65676b]">Brand</th>
               <th class="text-left px-4 py-3 text-sm font-medium text-[#65676b]">Vertical</th>
               <th class="text-left px-4 py-3 text-sm font-medium text-[#65676b]">Page ID</th>
@@ -1366,22 +1391,32 @@
       }
     });
 
+    // Track selected brands for bulk actions
+    let selectedBrandIdsForBulk = new Set();
+
     function renderBrandsTable() {
       const tbody = document.getElementById('brandsTableBody');
 
       if (brands.length === 0) {
         tbody.innerHTML = `
           <tr>
-            <td colspan="6" class="px-4 py-8 text-center text-[#65676b]">
+            <td colspan="7" class="px-4 py-8 text-center text-[#65676b]">
               No brands added yet. Click "Add Brand" to get started.
             </td>
           </tr>
         `;
+        updateBulkActionsBar();
         return;
       }
 
       tbody.innerHTML = brands.map(brand => `
         <tr class="border-t border-[#dddfe2] hover:bg-[#f5f6f7] transition-colors">
+          <td class="px-4 py-3">
+            <input type="checkbox" class="brand-row-checkbox w-4 h-4 rounded border-[#dddfe2] text-[#1877f2] focus:ring-[#1877f2] cursor-pointer" 
+                   data-brand-id="${brand.id}" 
+                   onchange="onBrandRowCheckboxChange(${brand.id})"
+                   ${selectedBrandIdsForBulk.has(brand.id) ? 'checked' : ''}>
+          </td>
           <td class="px-4 py-3">
             <div class="font-medium">${brand.brand_name}</div>
           </td>
@@ -1453,6 +1488,147 @@
     function closeBrandModal() {
       document.getElementById('brandModal').classList.add('hidden');
       editingBrandId = null;
+    }
+
+    // ============================================
+    // BRAND MULTI-SELECT FUNCTIONS
+    // ============================================
+    function onBrandRowCheckboxChange(brandId) {
+      if (selectedBrandIdsForBulk.has(brandId)) {
+        selectedBrandIdsForBulk.delete(brandId);
+      } else {
+        selectedBrandIdsForBulk.add(brandId);
+      }
+      updateBulkActionsBar();
+      updateSelectAllCheckbox();
+    }
+
+    function toggleSelectAllBrands() {
+      const selectAllCheckbox = document.getElementById('selectAllBrandsCheckbox');
+      const isChecked = selectAllCheckbox.checked;
+      
+      if (isChecked) {
+        brands.forEach(brand => selectedBrandIdsForBulk.add(brand.id));
+      } else {
+        selectedBrandIdsForBulk.clear();
+      }
+      
+      // Update all row checkboxes
+      document.querySelectorAll('.brand-row-checkbox').forEach(cb => {
+        cb.checked = isChecked;
+      });
+      
+      updateBulkActionsBar();
+    }
+
+    function updateSelectAllCheckbox() {
+      const selectAllCheckbox = document.getElementById('selectAllBrandsCheckbox');
+      if (!selectAllCheckbox) return;
+      
+      if (brands.length === 0) {
+        selectAllCheckbox.checked = false;
+        selectAllCheckbox.indeterminate = false;
+      } else if (selectedBrandIdsForBulk.size === brands.length) {
+        selectAllCheckbox.checked = true;
+        selectAllCheckbox.indeterminate = false;
+      } else if (selectedBrandIdsForBulk.size > 0) {
+        selectAllCheckbox.checked = false;
+        selectAllCheckbox.indeterminate = true;
+      } else {
+        selectAllCheckbox.checked = false;
+        selectAllCheckbox.indeterminate = false;
+      }
+    }
+
+    function updateBulkActionsBar() {
+      const bulkActionsBar = document.getElementById('bulkActionsBar');
+      const selectedCount = document.getElementById('selectedBrandsCount');
+      
+      if (selectedBrandIdsForBulk.size > 0) {
+        bulkActionsBar.classList.remove('hidden');
+        selectedCount.textContent = `${selectedBrandIdsForBulk.size} brand${selectedBrandIdsForBulk.size > 1 ? 's' : ''} selected`;
+      } else {
+        bulkActionsBar.classList.add('hidden');
+      }
+    }
+
+    function clearBrandSelection() {
+      selectedBrandIdsForBulk.clear();
+      document.querySelectorAll('.brand-row-checkbox').forEach(cb => {
+        cb.checked = false;
+      });
+      updateSelectAllCheckbox();
+      updateBulkActionsBar();
+    }
+
+    async function scrapeSelectedBrands() {
+      if (selectedBrandIdsForBulk.size === 0) return;
+      
+      const selectedIds = Array.from(selectedBrandIdsForBulk);
+      const selectedBrands = brands.filter(b => selectedIds.includes(b.id));
+      
+      showToast('info', 'Scraping Started', `Starting scrape for ${selectedBrands.length} brand${selectedBrands.length > 1 ? 's' : ''}...`);
+      
+      // Mark all selected brands as scraping
+      selectedIds.forEach(id => scrapingBrands.add(id));
+      renderBrandsTable();
+      
+      // Scrape each brand
+      for (const brand of selectedBrands) {
+        try {
+          const response = await fetch(`/api/brands/${brand.id}/scrape`, { method: 'POST' });
+          const result = await response.json();
+          
+          if (result.apifyRunId) {
+            pollScrapeCompletion(result.jobId, brand.brand_name, brand.id);
+          } else if (result.mock) {
+            scrapingBrands.delete(brand.id);
+            renderBrandsTable();
+            showToast('success', 'Scrape Complete', `${brand.brand_name}: ${result.adCount || 0} ads collected (demo mode)`);
+          }
+        } catch (error) {
+          scrapingBrands.delete(brand.id);
+          renderBrandsTable();
+          showToast('error', 'Scrape Failed', `Failed to scrape ${brand.brand_name}`);
+        }
+      }
+      
+      clearBrandSelection();
+    }
+
+    async function deleteSelectedBrands() {
+      if (selectedBrandIdsForBulk.size === 0) return;
+      
+      const count = selectedBrandIdsForBulk.size;
+      if (!confirm(`Are you sure you want to delete ${count} brand${count > 1 ? 's' : ''}? This will also delete all associated ads.`)) {
+        return;
+      }
+      
+      const selectedIds = Array.from(selectedBrandIdsForBulk);
+      let successCount = 0;
+      let errorCount = 0;
+      
+      for (const brandId of selectedIds) {
+        try {
+          const response = await fetch(`/api/brands/${brandId}`, { method: 'DELETE' });
+          if (response.ok) {
+            successCount++;
+          } else {
+            errorCount++;
+          }
+        } catch (error) {
+          errorCount++;
+        }
+      }
+      
+      clearBrandSelection();
+      await loadBrands();
+      
+      if (errorCount === 0) {
+        showToast('success', 'Brands Deleted', `Successfully deleted ${successCount} brand${successCount > 1 ? 's' : ''}`);
+      } else {
+        showToast('warning', 'Partial Success', `Deleted ${successCount} brand${successCount > 1 ? 's' : ''}, ${errorCount} failed`);
+      }
     }
 
     async function saveBrand(e) {
