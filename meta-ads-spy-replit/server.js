@@ -13,6 +13,7 @@
 require('dotenv').config();
 const express = require('express');
 const path = require('path');
+const fs = require('fs');
 const Database = require('better-sqlite3');
 const cron = require('node-cron');
 
@@ -27,7 +28,12 @@ app.use(express.static('public'));
 // ============================================
 // DATABASE SETUP
 // ============================================
-const db = new Database('./db/meta_ads.db');
+// Ensure db directory exists before creating database
+const dbDir = path.join(__dirname, 'db');
+if (!fs.existsSync(dbDir)) {
+  fs.mkdirSync(dbDir, { recursive: true });
+}
+const db = new Database(path.join(dbDir, 'meta_ads.db'));
 
 function initDatabase() {
   db.exec(`
