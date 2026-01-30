@@ -2003,36 +2003,56 @@
       const isBookmarked = ad.bookmarked === 1;
       const thumbnailUrl = getAdThumbnailUrl(ad);
       const hasValidThumbnail = !!thumbnailUrl;
+      const isVideo = ad.creative_type === 'video';
+      const videoUrl = ad.video_url || (isVideoUrl(ad.creative_url) ? ad.creative_url : null);
+      const cardId = `ad-card-${ad.ad_id || ad.id}`;
 
       return `
         <div class="ad-card glass-card overflow-hidden cursor-pointer fade-in" style="animation-delay: ${index * 30}ms" onclick="openAdModal('${ad.ad_id || ad.id}')">
-          <div class="relative overflow-hidden bg-[#f0f2f5]" style="aspect-ratio: 4/6;">
-            ${hasValidThumbnail ? `
-              <img src="${thumbnailUrl}"
-                   alt="Ad creative"
-                   class="w-full h-full object-cover"
-                   loading="lazy">
-            ` : `
-              <div class="w-full h-full flex flex-col items-center justify-center bg-[#e4e6eb]">
-                <svg class="w-16 h-16 text-[#65676b] mb-2" fill="currentColor" viewBox="0 0 24 24">
-                  <path d="M8 5v14l11-7z"/>
-                </svg>
-                <span class="text-[#65676b] text-sm">Video Ad</span>
+          <div id="${cardId}" class="relative overflow-hidden bg-[#f0f2f5]" style="aspect-ratio: 4/6;">
+            <div class="ad-thumbnail-container w-full h-full">
+              ${hasValidThumbnail ? `
+                <img src="${thumbnailUrl}"
+                     alt="Ad creative"
+                     class="w-full h-full object-cover"
+                     loading="lazy">
+              ` : `
+                <div class="w-full h-full flex flex-col items-center justify-center bg-[#e4e6eb]">
+                  <svg class="w-16 h-16 text-[#65676b] mb-2" fill="currentColor" viewBox="0 0 24 24">
+                    <path d="M8 5v14l11-7z"/>
+                  </svg>
+                  <span class="text-[#65676b] text-sm">Video Ad</span>
+                </div>
+              `}
+            </div>
+            ${isVideo && videoUrl ? `
+              <div class="video-container hidden absolute inset-0">
+                <video class="w-full h-full object-cover" playsinline>
+                  <source src="${videoUrl}" type="video/mp4">
+                </video>
               </div>
-            `}
-            <div class="absolute top-2 left-2 flex flex-wrap gap-1">
+              <button onclick="toggleVideoPlay(event, '${cardId}', '${videoUrl}')" 
+                      class="play-video-btn absolute inset-0 flex items-center justify-center bg-black/30 hover:bg-black/40 transition-colors group">
+                <div class="w-14 h-14 rounded-full bg-white/90 flex items-center justify-center shadow-lg group-hover:scale-110 transition-transform">
+                  <svg class="w-6 h-6 text-[#1877f2] ml-1" fill="currentColor" viewBox="0 0 24 24">
+                    <path d="M8 5v14l11-7z"/>
+                  </svg>
+                </div>
+              </button>
+            ` : ''}
+            <div class="absolute top-2 left-2 flex flex-wrap gap-1 z-10">
               <span class="badge badge-green">${startDateShort}</span>
               <span class="badge badge-blue">#${ad.rank || '-'}</span>
             </div>
             ${isBookmarked ? `
-              <div class="absolute top-2 right-2">
+              <div class="absolute top-2 right-2 z-10">
                 <svg class="w-5 h-5 text-[#f7931a]" fill="currentColor" stroke="currentColor" viewBox="0 0 24 24">
                   <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 5a2 2 0 012-2h10a2 2 0 012 2v16l-7-3.5L5 21V5z"/>
                 </svg>
               </div>
             ` : ''}
-            ${ad.creative_type === 'video' ? `
-              <div class="absolute bottom-2 right-2">
+            ${isVideo ? `
+              <div class="absolute bottom-2 right-2 z-10">
                 <span class="badge badge-gray flex items-center gap-1">
                   <svg class="w-3 h-3" fill="currentColor" viewBox="0 0 24 24">
                     <path d="M8 5v14l11-7z"/>
@@ -2861,6 +2881,95 @@
       const videoExtensions = ['.mp4', '.webm', '.mov', '.avi', '.mkv', '.m4v'];
       const lowerUrl = url.toLowerCase();
       return videoExtensions.some(ext => lowerUrl.includes(ext));
+    }
+
+    // Track currently playing video to pause it when another starts
+    let currentlyPlayingCard = null;
+
+    function toggleVideoPlay(event, cardId, videoUrl) {
+      event.stopPropagation(); // Prevent opening the modal
+      
+      const cardEl = document.getElementById(cardId);
+      if (!cardEl) return;
+      
+      const thumbnailContainer = cardEl.querySelector('.ad-thumbnail-container');
+      const videoContainer = cardEl.querySelector('.video-container');
+      const playBtn = cardEl.querySelector('.play-video-btn');
+      const video = videoContainer?.querySelector('video');
+      
+      if (!videoContainer || !video) return;
+      
+      // Check if this card is already playing
+      const isPlaying = !videoContainer.classList.contains('hidden');
+      
+      // Pause any currently playing video
+      if (currentlyPlayingCard && currentlyPlayingCard !== cardId) {
+        const prevCard = document.getElementById(currentlyPlayingCard);
+        if (prevCard) {
+          const prevVideo = prevCard.querySelector('video');
+          const prevThumbnail = prevCard.querySelector('.ad-thumbnail-container');
+          const prevVideoContainer = prevCard.querySelector('.video-container');
+          const prevPlayBtn = prevCard.querySelector('.play-video-btn');
+          
+          if (prevVideo) prevVideo.pause();
+          if (prevVideoContainer) prevVideoContainer.classList.add('hidden');
+          if (prevThumbnail) prevThumbnail.classList.remove('hidden');
+          if (prevPlayBtn) {
+            prevPlayBtn.classList.remove('hidden');
+            prevPlayBtn.innerHTML = `
+              <div class="w-14 h-14 rounded-full bg-white/90 flex items-center justify-center shadow-lg group-hover:scale-110 transition-transform">
+                <svg class="w-6 h-6 text-[#1877f2] ml-1" fill="currentColor" viewBox="0 0 24 24">
+                  <path d="M8 5v14l11-7z"/>
+                </svg>
+              </div>
+            `;
+          }
+        }
+      }
+      
+      if (isPlaying) {
+        // Pause and show thumbnail
+        video.pause();
+        videoContainer.classList.add('hidden');
+        thumbnailContainer.classList.remove('hidden');
+        playBtn.innerHTML = `
+          <div class="w-14 h-14 rounded-full bg-white/90 flex items-center justify-center shadow-lg group-hover:scale-110 transition-transform">
+            <svg class="w-6 h-6 text-[#1877f2] ml-1" fill="currentColor" viewBox="0 0 24 24">
+              <path d="M8 5v14l11-7z"/>
+            </svg>
+          </div>
+        `;
+        currentlyPlayingCard = null;
+      } else {
+        // Play video
+        thumbnailContainer.classList.add('hidden');
+        videoContainer.classList.remove('hidden');
+        video.play();
+        currentlyPlayingCard = cardId;
+        
+        // Change play button to pause button
+        playBtn.innerHTML = `
+          <div class="w-14 h-14 rounded-full bg-white/90 flex items-center justify-center shadow-lg group-hover:scale-110 transition-transform">
+            <svg class="w-6 h-6 text-[#1877f2]" fill="currentColor" viewBox="0 0 24 24">
+              <path d="M6 4h4v16H6V4zm8 0h4v16h-4V4z"/>
+            </svg>
+          </div>
+        `;
+        
+        // Reset to play button when video ends
+        video.onended = () => {
+          videoContainer.classList.add('hidden');
+          thumbnailContainer.classList.remove('hidden');
+          playBtn.innerHTML = `
+            <div class="w-14 h-14 rounded-full bg-white/90 flex items-center justify-center shadow-lg group-hover:scale-110 transition-transform">
+              <svg class="w-6 h-6 text-[#1877f2] ml-1" fill="currentColor" viewBox="0 0 24 24">
+                <path d="M8 5v14l11-7z"/>
+              </svg>
+            </div>
+          `;
+          currentlyPlayingCard = null;
+        };
+      }
     }
 
     // Get the best display URL for an ad thumbnail
