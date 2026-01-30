@@ -1,0 +1,2 @@
+# This file ensures the db/ directory exists when the zip is extracted
+# The SQLite database will be created here automatically on first run

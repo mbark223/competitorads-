@@ -1,0 +1,12 @@
+run = "npm install && npm start"
+entrypoint = "server.js"
+
+[nix]
+channel = "stable-24_05"
+
+[deployment]
+run = ["sh", "-c", "npm start"]
+
+[[ports]]
+localPort = 5000
+externalPort = 80
