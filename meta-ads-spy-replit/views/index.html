@@ -811,11 +811,13 @@
           <div class="flex flex-col md:flex-row gap-8">
             <!-- Left Column: Ad Preview + Dates -->
             <div class="md:w-2/5 flex flex-col">
-              <a id="adModalImageLink" href="#" target="_blank" class="block rounded-lg overflow-hidden bg-[#f0f2f5] mb-4 hover:opacity-90 transition-opacity cursor-pointer" style="aspect-ratio: 4/5;">
-                <div id="adModalImageContainer" class="w-full h-full">
-                  <img id="adModalImage" src="" alt="Ad creative" class="w-full h-full object-cover">
-                </div>
-              </a>
+              <div id="adModalMediaWrapper" class="relative block rounded-lg overflow-hidden bg-[#f0f2f5] mb-4" style="aspect-ratio: 4/5;">
+                <a id="adModalImageLink" href="#" target="_blank" class="block w-full h-full hover:opacity-90 transition-opacity cursor-pointer">
+                  <div id="adModalImageContainer" class="w-full h-full">
+                    <img id="adModalImage" src="" alt="Ad creative" class="w-full h-full object-cover">
+                  </div>
+                </a>
+              </div>
               <a id="adModalLink" href="#" target="_blank" class="btn-primary w-full py-3 rounded-lg font-medium flex items-center justify-center gap-2 mb-4">
                 <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 24 24">
                   <path d="M12 2C6.477 2 2 6.477 2 12c0 4.991 3.657 9.128 8.438 9.879V14.89h-2.54V12h2.54V9.797c0-2.506 1.492-3.89 3.777-3.89 1.094 0 2.238.195 2.238.195v2.46h-1.26c-1.243 0-1.63.771-1.63 1.562V12h2.773l-.443 2.89h-2.33v6.989C18.343 21.129 22 16.99 22 12c0-5.523-4.477-10-10-10z"/>
@@ -2085,14 +2087,15 @@
       const thumbnailUrl = getAdThumbnailUrl(currentAd);
       const videoUrl = currentAd.video_url;
       const hasVideo = videoUrl && isVideoUrl(videoUrl);
+      const mediaWrapper = document.getElementById('adModalMediaWrapper');
       const imageContainer = document.getElementById('adModalImageContainer');
       
       if (hasVideo) {
-        // Video ad with playback capability
-        imageContainer.innerHTML = `
-          <div class="relative w-full h-full">
-            <!-- Thumbnail container -->
-            <div id="modalThumbnailContainer" class="w-full h-full">
+        // Video ad - replace entire wrapper content to put play button outside link
+        mediaWrapper.innerHTML = `
+          <!-- Thumbnail container with link -->
+          <div id="modalThumbnailContainer" class="w-full h-full">
+            <a id="adModalImageLink" href="${currentAd.ad_library_link || '#'}" target="_blank" class="block w-full h-full hover:opacity-90 transition-opacity">
               ${thumbnailUrl 
                 ? `<img src="${thumbnailUrl}" alt="Ad creative" class="w-full h-full object-cover">`
                 : `<div class="w-full h-full flex flex-col items-center justify-center bg-[#e4e6eb]">
@@ -2102,32 +2105,40 @@
                     <span class="text-[#65676b]">Video Ad</span>
                   </div>`
               }
-            </div>
-            <!-- Video container (hidden by default) -->
-            <div id="modalVideoContainer" class="hidden w-full h-full absolute inset-0">
-              <video id="modalVideo" class="w-full h-full object-cover" src="${videoUrl}" playsinline></video>
-            </div>
-            <!-- Play/Pause button overlay -->
-            <button id="modalPlayBtn" onclick="toggleModalVideo(event)" class="absolute inset-0 flex items-center justify-center group z-10">
-              <div class="w-16 h-16 rounded-full bg-white/90 flex items-center justify-center shadow-lg group-hover:scale-110 transition-transform">
-                <svg class="w-7 h-7 text-[#1877f2] ml-1" fill="currentColor" viewBox="0 0 24 24">
-                  <path d="M8 5v14l11-7z"/>
-                </svg>
-              </div>
-            </button>
+            </a>
           </div>
+          <!-- Video container (hidden by default) -->
+          <div id="modalVideoContainer" class="hidden w-full h-full absolute inset-0 bg-black">
+            <video id="modalVideo" class="w-full h-full object-cover" src="${videoUrl}" playsinline></video>
+          </div>
+          <!-- Play/Pause button overlay -->
+          <button id="modalPlayBtn" onclick="toggleModalVideo(event)" class="absolute inset-0 flex items-center justify-center group z-20">
+            <div class="w-16 h-16 rounded-full bg-white/90 flex items-center justify-center shadow-lg group-hover:scale-110 transition-transform">
+              <svg class="w-7 h-7 text-[#1877f2] ml-1" fill="currentColor" viewBox="0 0 24 24">
+                <path d="M8 5v14l11-7z"/>
+              </svg>
+            </div>
+          </button>
         `;
       } else if (thumbnailUrl) {
-        imageContainer.innerHTML = `<img id="adModalImage" src="${thumbnailUrl}" alt="Ad creative" class="w-full h-full object-cover">`;
+        mediaWrapper.innerHTML = `
+          <a id="adModalImageLink" href="${currentAd.ad_library_link || '#'}" target="_blank" class="block w-full h-full hover:opacity-90 transition-opacity cursor-pointer">
+            <div id="adModalImageContainer" class="w-full h-full">
+              <img id="adModalImage" src="${thumbnailUrl}" alt="Ad creative" class="w-full h-full object-cover">
+            </div>
+          </a>
+        `;
       } else {
-        imageContainer.innerHTML = `
-          <div class="w-full h-full flex flex-col items-center justify-center bg-[#e4e6eb]">
-            <svg class="w-20 h-20 text-[#65676b] mb-3" fill="currentColor" viewBox="0 0 24 24">
-              <path d="M8 5v14l11-7z"/>
-            </svg>
-            <span class="text-[#65676b]">Video Ad</span>
-            <span class="text-[#8a8d91] text-sm mt-1">Thumbnail not available</span>
-          </div>
+        mediaWrapper.innerHTML = `
+          <a id="adModalImageLink" href="${currentAd.ad_library_link || '#'}" target="_blank" class="block w-full h-full hover:opacity-90 transition-opacity cursor-pointer">
+            <div id="adModalImageContainer" class="w-full h-full flex flex-col items-center justify-center bg-[#e4e6eb]">
+              <svg class="w-20 h-20 text-[#65676b] mb-3" fill="currentColor" viewBox="0 0 24 24">
+                <path d="M8 5v14l11-7z"/>
+              </svg>
+              <span class="text-[#65676b]">Video Ad</span>
+              <span class="text-[#8a8d91] text-sm mt-1">Thumbnail not available</span>
+            </div>
+          </a>
         `;
       }
 
