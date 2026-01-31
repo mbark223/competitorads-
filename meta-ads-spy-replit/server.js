@@ -990,6 +990,33 @@ function transformApifyResults(apifyResults, brandId) {
       // Fallback to snapshot.images array
       creativeUrl = extractUrl(snapshot.images[0]);
     }
+    
+    // Additional fallbacks - try to find any media URL in the item
+    if (!creativeUrl && !videoUrl) {
+      // Check for direct image/video URLs on the item or snapshot
+      const possibleMediaFields = [
+        item.imageUrl, item.image_url, item.thumbnailUrl, item.thumbnail_url,
+        item.mediaUrl, item.media_url, item.previewUrl, item.preview_url,
+        snapshot.imageUrl, snapshot.image_url, snapshot.thumbnailUrl, snapshot.thumbnail_url,
+        snapshot.mediaUrl, snapshot.media_url, snapshot.previewUrl, snapshot.preview_url,
+        firstCard.imageUrl, firstCard.image_url, firstCard.thumbnailUrl, firstCard.thumbnail_url
+      ];
+      
+      for (const field of possibleMediaFields) {
+        if (field && typeof field === 'string' && field.startsWith('http')) {
+          creativeUrl = field;
+          break;
+        }
+      }
+      
+      // Log if we still can't find media (for debugging)
+      if (!creativeUrl) {
+        console.log(`No media found for ad ${adId}. Available fields:`, 
+          Object.keys(snapshot).join(', '), 
+          '| cards[0] fields:', Object.keys(firstCard).join(', ')
+        );
+      }
+    }
 
     // Final safety check - ensure URLs are strings
     if (creativeUrl && typeof creativeUrl !== 'string') {
@@ -1053,16 +1080,38 @@ function transformApifyResults(apifyResults, brandId) {
 }
 
 function processScrapedAds(brandId, scrapedAds) {
+  // Verify brand exists before processing
+  const brand = db.prepare('SELECT id FROM brands WHERE id = ?').get(brandId);
+  if (!brand) {
+    console.error(`Brand ${brandId} not found in database, skipping ad processing`);
+    return [];
+  }
+
   const weekStart = getWeekStart();
   const today = new Date().toISOString().split('T')[0];
 
   // Get the ad_ids from the new scrape
   const newAdIds = scrapedAds.map(ad => ad.ad_id);
 
-  // Delete old ads for this brand that aren't in the new top 10
+  // Delete old ads for this brand that aren't in the new top 20
   // BUT preserve bookmarked ads - users explicitly saved those
   if (newAdIds.length > 0) {
     const placeholders = newAdIds.map(() => '?').join(',');
+    
+    // First, get the ad_ids that will be deleted
+    const adsToDelete = db.prepare(`
+      SELECT ad_id FROM ad_vault 
+      WHERE brand_id = ? AND ad_id NOT IN (${placeholders}) AND (bookmarked = 0 OR bookmarked IS NULL)
+    `).all(brandId, ...newAdIds);
+    
+    // Delete references from weekly_snapshots first (foreign key constraint)
+    if (adsToDelete.length > 0) {
+      const deleteIds = adsToDelete.map(a => a.ad_id);
+      const deletePlaceholders = deleteIds.map(() => '?').join(',');
+      db.prepare(`DELETE FROM weekly_snapshots WHERE ad_id IN (${deletePlaceholders})`).run(...deleteIds);
+    }
+    
+    // Now safe to delete from ad_vault
     const deleted = db.prepare(`
       DELETE FROM ad_vault
       WHERE brand_id = ? AND ad_id NOT IN (${placeholders}) AND (bookmarked = 0 OR bookmarked IS NULL)
