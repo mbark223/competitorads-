@@ -570,11 +570,11 @@ async function startAdLibraryScrape(brand) {
   const adLibraryUrl = buildAdLibraryUrl(brand.page_id);
 
   // Configure input for the Meta Ad Library scraper actor (JJghSZmShuco4j9gJ)
-  // Request 20 results to account for duplicates - we'll dedupe down to 10 unique ads
+  // Request 50 results to account for duplicates - we'll dedupe down to 20 unique ads
   // Cost: $5 per 1,000 ads on Apify Starter plan
   const input = {
     startUrls: [{ url: adLibraryUrl }],
-    resultsLimit: 20,  // Fetch 20 to dedupe down to 10 (balance cost vs coverage)
+    resultsLimit: 50,  // Fetch 50 to dedupe down to 20 (more coverage)
     activeStatus: 'active'
   };
 
@@ -924,11 +924,11 @@ function transformApifyResults(apifyResults, brandId) {
   const uniqueResults = Array.from(headlineGrouped.values()).map(v => v.item);
   console.log(`Headline dedup: ${afterMediaDedup.length} -> ${uniqueResults.length} ads`);
 
-  // Limit to top 10 unique ads
-  const top10Unique = uniqueResults.slice(0, 10);
-  console.log(`Keeping top ${top10Unique.length} of ${uniqueResults.length} unique ads`);
+  // Limit to top 20 unique ads
+  const top20Unique = uniqueResults.slice(0, 20);
+  console.log(`Keeping top ${top20Unique.length} of ${uniqueResults.length} unique ads`);
 
-  return top10Unique.map((item, index) => {
+  return top20Unique.map((item, index) => {
     // The actor returns: adArchiveID, snapshot.cards[], startDate, etc.
     const adId = item.adArchiveID || item.adArchiveId || item.adid || `apify_${Date.now()}_${index}`;
 
