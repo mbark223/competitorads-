@@ -814,7 +814,7 @@
               <div id="adModalMediaWrapper" class="relative block rounded-lg overflow-hidden bg-[#f0f2f5] mb-4" style="aspect-ratio: 4/5;">
                 <a id="adModalImageLink" href="#" target="_blank" class="block w-full h-full hover:opacity-90 transition-opacity cursor-pointer">
                   <div id="adModalImageContainer" class="w-full h-full">
-                    <img id="adModalImage" src="" alt="Ad creative" class="w-full h-full object-cover">
+                    <img id="adModalImage" src="" alt="Ad creative" class="w-full h-full object-contain bg-black">
                   </div>
                 </a>
               </div>
@@ -2011,7 +2011,7 @@
               ${hasValidThumbnail ? `
                 <img src="${thumbnailUrl}"
                      alt="Ad creative"
-                     class="w-full h-full object-cover"
+                     class="w-full h-full object-contain bg-black"
                      loading="lazy">
               ` : `
                 <div class="w-full h-full flex flex-col items-center justify-center bg-[#e4e6eb]">
@@ -2023,8 +2023,8 @@
               `}
             </div>
             ${isVideo && videoUrl ? `
-              <div class="video-container hidden absolute inset-0">
-                <video class="w-full h-full object-cover" playsinline>
+              <div class="video-container hidden absolute inset-0 bg-black">
+                <video class="w-full h-full object-contain" playsinline>
                   <source src="${videoUrl}" type="video/mp4">
                 </video>
               </div>
@@ -2097,7 +2097,7 @@
           <div id="modalThumbnailContainer" class="w-full h-full">
             <a id="adModalImageLink" href="${currentAd.ad_library_link || '#'}" target="_blank" class="block w-full h-full hover:opacity-90 transition-opacity">
               ${thumbnailUrl 
-                ? `<img src="${thumbnailUrl}" alt="Ad creative" class="w-full h-full object-cover">`
+                ? `<img src="${thumbnailUrl}" alt="Ad creative" class="w-full h-full object-contain bg-black">`
                 : `<div class="w-full h-full flex flex-col items-center justify-center bg-[#e4e6eb]">
                     <svg class="w-20 h-20 text-[#65676b] mb-3" fill="currentColor" viewBox="0 0 24 24">
                       <path d="M8 5v14l11-7z"/>
@@ -2109,7 +2109,7 @@
           </div>
           <!-- Video container (hidden by default) -->
           <div id="modalVideoContainer" class="hidden w-full h-full absolute inset-0 bg-black">
-            <video id="modalVideo" class="w-full h-full object-cover" src="${videoUrl}" playsinline></video>
+            <video id="modalVideo" class="w-full h-full object-contain bg-black" src="${videoUrl}" playsinline></video>
           </div>
           <!-- Play/Pause button overlay -->
           <button id="modalPlayBtn" onclick="toggleModalVideo(event)" class="absolute inset-0 flex items-center justify-center group z-20">
@@ -2124,7 +2124,7 @@
         mediaWrapper.innerHTML = `
           <a id="adModalImageLink" href="${currentAd.ad_library_link || '#'}" target="_blank" class="block w-full h-full hover:opacity-90 transition-opacity cursor-pointer">
             <div id="adModalImageContainer" class="w-full h-full">
-              <img id="adModalImage" src="${thumbnailUrl}" alt="Ad creative" class="w-full h-full object-cover">
+              <img id="adModalImage" src="${thumbnailUrl}" alt="Ad creative" class="w-full h-full object-contain bg-black">
             </div>
           </a>
         `;
