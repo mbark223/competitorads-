@@ -13,8 +13,7 @@
 require('dotenv').config();
 const express = require('express');
 const path = require('path');
-const fs = require('fs');
-const Database = require('better-sqlite3');
+const { createClient } = require('@libsql/client');
 const cron = require('node-cron');
 
 const app = express();
@@ -26,17 +25,16 @@ app.use(express.urlencoded({ extended: true }));
 app.use(express.static('public'));
 
 // ============================================
-// DATABASE SETUP
+// DATABASE SETUP (TURSO)
 // ============================================
-// Ensure db directory exists before creating database
-const dbDir = path.join(__dirname, 'db');
-if (!fs.existsSync(dbDir)) {
-  fs.mkdirSync(dbDir, { recursive: true });
-}
-const db = new Database(path.join(dbDir, 'meta_ads.db'));
+const db = createClient({
+  url: process.env.TURSO_DATABASE_URL || 'file:local.db',
+  authToken: process.env.TURSO_AUTH_TOKEN,
+});
 
-function initDatabase() {
-  db.exec(`
+async function initDatabase() {
+  // Execute schema creation queries
+  const schema = `
     -- Brands: DTC brands we're monitoring
     CREATE TABLE IF NOT EXISTS brands (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -73,6 +71,12 @@ function initDatabase() {
       ai_visual_style TEXT,
       ai_angle TEXT,
       ai_raw_response TEXT,
+      ai_asset_type TEXT,
+      ai_visual_format TEXT,
+      ai_messaging_angle TEXT,
+      ai_hook_tactic TEXT,
+      ai_offer_type TEXT,
+      bookmarked INTEGER DEFAULT 0,
       -- Tracking
       first_seen DATE,
       last_seen DATE,
@@ -107,115 +111,104 @@ function initDatabase() {
       UNIQUE(brand_id, ad_id, week_start)
     );
 
-    -- Indexes for faster lookups
-    CREATE INDEX IF NOT EXISTS idx_brands_page_id ON brands(page_id);
-    CREATE INDEX IF NOT EXISTS idx_brands_status ON brands(status);
-    CREATE INDEX IF NOT EXISTS idx_ad_vault_brand_id ON ad_vault(brand_id);
-    CREATE INDEX IF NOT EXISTS idx_ad_vault_ad_id ON ad_vault(ad_id);
-    CREATE INDEX IF NOT EXISTS idx_ad_vault_last_seen ON ad_vault(last_seen);
-    CREATE INDEX IF NOT EXISTS idx_jobs_status ON scrape_jobs(status);
-    CREATE INDEX IF NOT EXISTS idx_snapshots_week ON weekly_snapshots(week_start);
-
     -- Settings: App configuration
     CREATE TABLE IF NOT EXISTS settings (
       key TEXT PRIMARY KEY,
       value TEXT,
       updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
-  `);
+  `;
 
-  // Migration: Add video_url column if it doesn't exist
-  try {
-    db.exec(`ALTER TABLE ad_vault ADD COLUMN video_url TEXT`);
-    console.log('Added video_url column to ad_vault table');
-  } catch (e) {
-    // Column already exists, ignore
-  }
-
-  // Migration: Add new AI tag columns (expanded taxonomy)
-  const newAiColumns = [
-    'ai_asset_type TEXT',      // UGC, High Production, Static Image, Animation
-    'ai_visual_format TEXT',   // Talking head, Product demo, Unboxing, Split screen, etc.
-    'ai_messaging_angle TEXT', // Problem/Solution, Social proof, FOMO, Aspiration, etc.
-    'ai_hook_tactic TEXT',     // Pattern interrupt, Question, Bold claim, Curiosity, etc.
-    'ai_offer_type TEXT'       // Percentage off, Free shipping, BOGO, Free trial, No offer
-  ];
-
-  for (const colDef of newAiColumns) {
-    try {
-      db.exec(`ALTER TABLE ad_vault ADD COLUMN ${colDef}`);
-      console.log(`Added ${colDef.split(' ')[0]} column to ad_vault table`);
-    } catch (e) {
-      // Column already exists, ignore
+  // Split and execute each statement
+  const statements = schema.split(';').filter(s => s.trim());
+  for (const stmt of statements) {
+    if (stmt.trim()) {
+      await db.execute(stmt);
     }
   }
 
-  // Migration: Add bookmarked column
-  try {
-    db.exec(`ALTER TABLE ad_vault ADD COLUMN bookmarked INTEGER DEFAULT 0`);
-    console.log('Added bookmarked column to ad_vault table');
-  } catch (e) {
-    // Column already exists, ignore
+  // Create indexes
+  const indexes = [
+    'CREATE INDEX IF NOT EXISTS idx_brands_page_id ON brands(page_id)',
+    'CREATE INDEX IF NOT EXISTS idx_brands_status ON brands(status)',
+    'CREATE INDEX IF NOT EXISTS idx_ad_vault_brand_id ON ad_vault(brand_id)',
+    'CREATE INDEX IF NOT EXISTS idx_ad_vault_ad_id ON ad_vault(ad_id)',
+    'CREATE INDEX IF NOT EXISTS idx_ad_vault_last_seen ON ad_vault(last_seen)',
+    'CREATE INDEX IF NOT EXISTS idx_jobs_status ON scrape_jobs(status)',
+    'CREATE INDEX IF NOT EXISTS idx_snapshots_week ON weekly_snapshots(week_start)'
+  ];
+
+  for (const idx of indexes) {
+    await db.execute(idx);
   }
+
+  console.log('Database initialized successfully');
 }
 
-initDatabase();
+// Initialize database and clean up on startup
+async function startup() {
+  await initDatabase();
+  await cleanupOrphanedData();
+  setupScheduledScrape();
+}
 
 // Clean up orphaned data on startup
-function cleanupOrphanedData() {
+async function cleanupOrphanedData() {
   try {
     // Delete ads that reference non-existent brands
-    const orphanedAds = db.prepare(`
+    const orphanedAds = await db.execute(`
       DELETE FROM ad_vault
       WHERE brand_id NOT IN (SELECT id FROM brands)
-    `).run();
+    `);
 
     // Delete weekly snapshots that reference non-existent brands
-    const orphanedSnapshots = db.prepare(`
+    const orphanedSnapshots = await db.execute(`
       DELETE FROM weekly_snapshots
       WHERE brand_id NOT IN (SELECT id FROM brands)
-    `).run();
+    `);
 
     // Delete scrape jobs that reference non-existent brands
-    const orphanedJobs = db.prepare(`
+    const orphanedJobs = await db.execute(`
       DELETE FROM scrape_jobs
       WHERE brand_id NOT IN (SELECT id FROM brands)
-    `).run();
+    `);
 
-    const totalCleaned = orphanedAds.changes + orphanedSnapshots.changes + orphanedJobs.changes;
+    const totalCleaned = orphanedAds.rowsAffected + orphanedSnapshots.rowsAffected + orphanedJobs.rowsAffected;
     if (totalCleaned > 0) {
-      console.log(`Cleaned up orphaned data: ${orphanedAds.changes} ads, ${orphanedSnapshots.changes} snapshots, ${orphanedJobs.changes} jobs`);
+      console.log(`Cleaned up orphaned data: ${orphanedAds.rowsAffected} ads, ${orphanedSnapshots.rowsAffected} snapshots, ${orphanedJobs.rowsAffected} jobs`);
     }
   } catch (error) {
     console.error('Cleanup error:', error);
   }
 }
 
-cleanupOrphanedData();
-
 // ============================================
 // SCHEDULED SCRAPING
 // ============================================
 let scheduledTask = null;
 
-function getSetting(key, defaultValue = null) {
-  const row = db.prepare('SELECT value FROM settings WHERE key = ?').get(key);
-  return row ? row.value : defaultValue;
+async function getSetting(key, defaultValue = null) {
+  const result = await db.execute({
+    sql: 'SELECT value FROM settings WHERE key = ?',
+    args: [key]
+  });
+  return result.rows.length > 0 ? result.rows[0].value : defaultValue;
 }
 
-function setSetting(key, value) {
-  db.prepare(`
-    INSERT OR REPLACE INTO settings (key, value, updated_at)
-    VALUES (?, ?, CURRENT_TIMESTAMP)
-  `).run(key, value);
+async function setSetting(key, value) {
+  await db.execute({
+    sql: `INSERT OR REPLACE INTO settings (key, value, updated_at)
+          VALUES (?, ?, CURRENT_TIMESTAMP)`,
+    args: [key, value]
+  });
 }
 
-function getScheduleSettings() {
+async function getScheduleSettings() {
   return {
-    enabled: getSetting('schedule_enabled', 'false') === 'true',
-    day: getSetting('schedule_day', '1'), // 0=Sunday, 1=Monday, etc.
-    hour: getSetting('schedule_hour', '6'), // Hour of day (0-23)
-    autoAnalyze: getSetting('auto_analyze', 'false') === 'true'
+    enabled: (await getSetting('schedule_enabled', 'false')) === 'true',
+    day: await getSetting('schedule_day', '1'),
+    hour: await getSetting('schedule_hour', '6'),
+    autoAnalyze: (await getSetting('auto_analyze', 'false')) === 'true'
   };
 }
 
@@ -226,36 +219,35 @@ function setupScheduledScrape() {
     scheduledTask = null;
   }
 
-  const settings = getScheduleSettings();
-  if (!settings.enabled) {
-    console.log('Scheduled scraping is disabled');
-    return;
-  }
-
-  // Create cron expression: minute hour * * dayOfWeek
-  // Run at the specified hour on the specified day
-  const cronExpression = `0 ${settings.hour} * * ${settings.day}`;
-
-  scheduledTask = cron.schedule(cronExpression, async () => {
-    console.log('Starting scheduled weekly scrape...');
-    try {
-      await runScheduledScrapeAll();
-    } catch (error) {
-      console.error('Scheduled scrape failed:', error);
+  getScheduleSettings().then(settings => {
+    if (!settings.enabled) {
+      console.log('Scheduled scraping is disabled');
+      return;
     }
-  });
 
-  const days = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
-  console.log(`Scheduled scraping enabled: ${days[settings.day]} at ${settings.hour}:00`);
+    const cronExpression = `0 ${settings.hour} * * ${settings.day}`;
+
+    scheduledTask = cron.schedule(cronExpression, async () => {
+      console.log('Starting scheduled weekly scrape...');
+      try {
+        await runScheduledScrapeAll();
+      } catch (error) {
+        console.error('Scheduled scrape failed:', error);
+      }
+    });
+
+    const days = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+    console.log(`Scheduled scraping enabled: ${days[settings.day]} at ${settings.hour}:00`);
+  });
 }
 
 async function runScheduledScrapeAll() {
-  const settings = getScheduleSettings();
+  const settings = await getScheduleSettings();
 
-  // Get all active brands with page IDs
-  const brands = db.prepare(`
+  const result = await db.execute(`
     SELECT * FROM brands WHERE status = 'active' AND page_id IS NOT NULL AND page_id != ''
-  `).all();
+  `);
+  const brands = result.rows;
 
   if (brands.length === 0) {
     console.log('No brands to scrape');
@@ -270,12 +262,9 @@ async function runScheduledScrapeAll() {
   for (const brand of brands) {
     try {
       console.log(`Scraping ${brand.brand_name}...`);
-
-      // Start the scrape job
       const jobResult = await startAdLibraryScrape(brand);
 
       if (jobResult.apifyRunId) {
-        // Poll until complete
         let status = 'RUNNING';
         while (status === 'RUNNING' || status === 'READY') {
           await new Promise(resolve => setTimeout(resolve, 5000));
@@ -283,22 +272,21 @@ async function runScheduledScrapeAll() {
         }
 
         if (status === 'SUCCEEDED') {
-          // Get and process results
           const results = await getApifyResults(jobResult.apifyRunId);
           const transformed = transformApifyResults(results, brand.id);
 
-          // Store ads (reuse existing logic)
           for (const ad of transformed) {
             try {
-              db.prepare(`
-                INSERT OR REPLACE INTO ad_vault
-                (ad_id, brand_id, date_scraped, rank, creative_type, creative_url, ad_copy, headline, cta_type, start_date, ad_library_link, first_seen, last_seen, weeks_in_top10, video_url)
-                VALUES (?, ?, date('now'), ?, ?, ?, ?, ?, ?, ?, ?, COALESCE((SELECT first_seen FROM ad_vault WHERE ad_id = ?), date('now')), date('now'), COALESCE((SELECT weeks_in_top10 FROM ad_vault WHERE ad_id = ?), 0) + 1, ?)
-              `).run(
-                ad.ad_id, brand.id, ad.rank, ad.creative_type, ad.creative_url,
-                ad.ad_copy, ad.headline, ad.cta_type, ad.start_date, ad.ad_library_link,
-                ad.ad_id, ad.ad_id, ad.video_url
-              );
+              await db.execute({
+                sql: `INSERT OR REPLACE INTO ad_vault
+                      (ad_id, brand_id, date_scraped, rank, creative_type, creative_url, ad_copy, headline, cta_type, start_date, ad_library_link, first_seen, last_seen, weeks_in_top10, video_url)
+                      VALUES (?, ?, date('now'), ?, ?, ?, ?, ?, ?, ?, ?, COALESCE((SELECT first_seen FROM ad_vault WHERE ad_id = ?), date('now')), date('now'), COALESCE((SELECT weeks_in_top10 FROM ad_vault WHERE ad_id = ?), 0) + 1, ?)`,
+                args: [
+                  ad.ad_id, brand.id, ad.rank, ad.creative_type, ad.creative_url,
+                  ad.ad_copy, ad.headline, ad.cta_type, ad.start_date, ad.ad_library_link,
+                  ad.ad_id, ad.ad_id, ad.video_url
+                ]
+              });
             } catch (e) {
               // Ignore duplicate errors
             }
@@ -312,7 +300,6 @@ async function runScheduledScrapeAll() {
         }
       }
 
-      // Delay between brands
       await new Promise(resolve => setTimeout(resolve, 2000));
     } catch (error) {
       errorCount++;
@@ -322,7 +309,6 @@ async function runScheduledScrapeAll() {
 
   console.log(`Scheduled scrape complete: ${successCount} succeeded, ${errorCount} failed`);
 
-  // Auto-analyze if enabled
   if (settings.autoAnalyze) {
     console.log('Starting auto-analysis of new ads...');
     await runBatchAnalysis();
@@ -330,11 +316,12 @@ async function runScheduledScrapeAll() {
 }
 
 async function runBatchAnalysis() {
-  const unanalyzedAds = db.prepare(`
+  const result = await db.execute(`
     SELECT * FROM ad_vault
     WHERE ai_asset_type IS NULL OR ai_asset_type = ''
     ORDER BY created_at DESC
-  `).all();
+  `);
+  const unanalyzedAds = result.rows;
 
   if (unanalyzedAds.length === 0) {
     console.log('No unanalyzed ads found');
@@ -348,21 +335,22 @@ async function runBatchAnalysis() {
     try {
       const analysis = await analyzeAdCreative(ad);
 
-      db.prepare(`
-        UPDATE ad_vault
-        SET ai_asset_type = ?, ai_visual_format = ?, ai_messaging_angle = ?,
-            ai_hook_tactic = ?, ai_offer_type = ?,
-            ai_raw_response = ?, updated_at = CURRENT_TIMESTAMP
-        WHERE id = ?
-      `).run(
-        analysis.asset_type,
-        analysis.visual_format,
-        analysis.messaging_angle,
-        analysis.hook_tactic,
-        analysis.offer_type,
-        JSON.stringify(analysis),
-        ad.id
-      );
+      await db.execute({
+        sql: `UPDATE ad_vault
+              SET ai_asset_type = ?, ai_visual_format = ?, ai_messaging_angle = ?,
+                  ai_hook_tactic = ?, ai_offer_type = ?,
+                  ai_raw_response = ?, updated_at = CURRENT_TIMESTAMP
+              WHERE id = ?`,
+        args: [
+          analysis.asset_type,
+          analysis.visual_format,
+          analysis.messaging_angle,
+          analysis.hook_tactic,
+          analysis.offer_type,
+          JSON.stringify(analysis),
+          ad.id
+        ]
+      });
 
       analyzed++;
       if (analyzed % 10 === 0) {
@@ -378,16 +366,11 @@ async function runBatchAnalysis() {
   console.log(`Auto-analysis complete: ${analyzed} ads analyzed`);
 }
 
-// Initialize scheduled scraping on startup
-setupScheduledScrape();
-
 // ============================================
 // CONFIGURATION
 // ============================================
 const APIFY_TOKEN = process.env.APIFY_TOKEN;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-
-// Apify actor for Meta Ad Library scraping
 const META_AD_SCRAPER_ID = 'JJghSZmShuco4j9gJ';
 
 // ============================================
@@ -397,15 +380,13 @@ const META_AD_SCRAPER_ID = 'JJghSZmShuco4j9gJ';
 function getWeekStart(date = new Date()) {
   const d = new Date(date);
   const day = d.getDay();
-  const diff = d.getDate() - day + (day === 0 ? -6 : 1); // Monday
+  const diff = d.getDate() - day + (day === 0 ? -6 : 1);
   d.setDate(diff);
   d.setHours(0, 0, 0, 0);
   return d.toISOString().split('T')[0];
 }
 
 function buildAdLibraryUrl(pageId) {
-  // Construct URL that shows ads sorted by impressions (high to low)
-  // Using the exact format Meta uses - not URL encoding the brackets
   return `https://www.facebook.com/ads/library/?active_status=active&ad_type=all&country=US&media_type=all&search_type=page&sort_data[direction]=desc&sort_data[mode]=total_impressions&view_all_page_id=${pageId}`;
 }
 
@@ -414,8 +395,6 @@ function buildAdLibraryUrl(pageId) {
 // ============================================
 
 async function resolvePageId(fbPageUrl) {
-  // Try to extract page ID from Facebook page URL
-  // Method 1: Direct fetch and parse HTML for pageID
   try {
     const response = await fetch(fbPageUrl, {
       headers: {
@@ -424,7 +403,6 @@ async function resolvePageId(fbPageUrl) {
     });
     const html = await response.text();
 
-    // Try various patterns to find page ID
     const patterns = [
       /"pageID":"(\d+)"/,
       /page_id=(\d+)/,
@@ -447,7 +425,6 @@ async function resolvePageId(fbPageUrl) {
   }
 }
 
-// ScrapeCreators API for resolving page IDs by company name
 const SCRAPECREATORS_API_KEY = 'FuiEHykLZFRegUICP0wcIRodWpJ3';
 
 async function resolvePageIdByName(brandName) {
@@ -467,16 +444,12 @@ async function resolvePageIdByName(brandName) {
       return null;
     }
 
-    // Find the best match - prefer verified pages with most likes
     const results = data.searchResults;
-
-    // First try to find a BLUE_VERIFIED result
     const verified = results.find(r => r.verification === 'BLUE_VERIFIED');
     if (verified) {
       return verified.page_id;
     }
 
-    // Otherwise return the first result (usually highest relevance)
     return results[0].page_id;
   } catch (error) {
     console.error('ScrapeCreators API error:', error);
@@ -532,7 +505,6 @@ function getMockAds(brandId, count = 10) {
 }
 
 function getMockAdAnalysis() {
-  // New expanded taxonomy
   const assetTypes = ['UGC', 'High Production', 'Static Image', 'Animation'];
   const visualFormats = ['Talking Head', 'Product Demo', 'Unboxing', 'Before/After', 'Text Overlay', 'Lifestyle', 'Testimonial Compilation'];
   const messagingAngles = ['Problem/Solution', 'Social Proof', 'FOMO', 'Aspiration', 'Value Proposition', 'Transformation'];
@@ -558,23 +530,20 @@ async function startAdLibraryScrape(brand) {
     console.log('No APIFY_TOKEN configured, using mock data');
     const mockAds = getMockAds(brand.id, 10);
 
-    const job = db.prepare(`
-      INSERT INTO scrape_jobs (job_type, brand_id, status, input_params, results, result_count, completed_at)
-      VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-    `).run('ad_scrape', brand.id, 'complete', JSON.stringify({ page_id: brand.page_id }), JSON.stringify(mockAds), mockAds.length);
+    const result = await db.execute({
+      sql: `INSERT INTO scrape_jobs (job_type, brand_id, status, input_params, results, result_count, completed_at)
+            VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
+      args: ['ad_scrape', brand.id, 'complete', JSON.stringify({ page_id: brand.page_id }), JSON.stringify(mockAds), mockAds.length]
+    });
 
-    return { jobId: job.lastInsertRowid, mock: true };
+    return { jobId: result.lastInsertRowid, mock: true };
   }
 
-  // Build Ad Library URL with impression sorting
   const adLibraryUrl = buildAdLibraryUrl(brand.page_id);
 
-  // Configure input for the Meta Ad Library scraper actor (JJghSZmShuco4j9gJ)
-  // Request 50 results to account for duplicates - we'll dedupe down to 20 unique ads
-  // Cost: $5 per 1,000 ads on Apify Starter plan
   const input = {
     startUrls: [{ url: adLibraryUrl }],
-    resultsLimit: 50,  // Fetch 50 to dedupe down to 20 (more coverage)
+    resultsLimit: 50,
     activeStatus: 'active'
   };
 
@@ -598,21 +567,23 @@ async function startAdLibraryScrape(brand) {
     const data = await response.json();
     console.log(`Apify run started: ${data.data.id}`);
 
-    const job = db.prepare(`
-      INSERT INTO scrape_jobs (job_type, brand_id, apify_run_id, status, input_params)
-      VALUES (?, ?, ?, ?, ?)
-    `).run('ad_scrape', brand.id, data.data.id, 'running', JSON.stringify(input));
+    const result = await db.execute({
+      sql: `INSERT INTO scrape_jobs (job_type, brand_id, apify_run_id, status, input_params)
+            VALUES (?, ?, ?, ?, ?)`,
+      args: ['ad_scrape', brand.id, data.data.id, 'running', JSON.stringify(input)]
+    });
 
-    return { jobId: job.lastInsertRowid, apifyRunId: data.data.id };
+    return { jobId: result.lastInsertRowid, apifyRunId: data.data.id };
   } catch (error) {
     console.error('Apify scrape error:', error);
 
-    const job = db.prepare(`
-      INSERT INTO scrape_jobs (job_type, brand_id, status, input_params, error_message, completed_at)
-      VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-    `).run('ad_scrape', brand.id, 'error', JSON.stringify(input), error.message);
+    const result = await db.execute({
+      sql: `INSERT INTO scrape_jobs (job_type, brand_id, status, input_params, error_message, completed_at)
+            VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
+      args: ['ad_scrape', brand.id, 'error', JSON.stringify(input), error.message]
+    });
 
-    return { jobId: job.lastInsertRowid, error: error.message };
+    return { jobId: result.lastInsertRowid, error: error.message };
   }
 }
 
@@ -646,7 +617,6 @@ async function getApifyResults(apifyRunId) {
 // ============================================
 
 async function analyzeAdCreative(ad) {
-  // Check if we already have the new expanded analysis
   if (ad.ai_asset_type && ad.ai_visual_format && ad.ai_messaging_angle && ad.ai_hook_tactic && ad.ai_offer_type) {
     return {
       asset_type: ad.ai_asset_type,
@@ -654,7 +624,6 @@ async function analyzeAdCreative(ad) {
       messaging_angle: ad.ai_messaging_angle,
       hook_tactic: ad.ai_hook_tactic,
       offer_type: ad.ai_offer_type,
-      // Keep legacy fields for backward compatibility
       format: ad.ai_format,
       hook: ad.ai_hook,
       visual_style: ad.ai_visual_style,
@@ -669,7 +638,6 @@ async function analyzeAdCreative(ad) {
 
   const isVideo = ad.creative_type === 'video' && ad.video_url;
 
-  // Expanded AI tagging prompt based on Motion's taxonomy
   const prompt = `Analyze this DTC ${isVideo ? 'video' : 'image'} ad creative. Return a JSON object with these 5 categories:
 
 1. "asset_type": Choose ONE from: "UGC", "High Production", "Static Image", "Animation", "Screen Recording", "Stock Footage"
@@ -693,7 +661,6 @@ Return ONLY valid JSON with these 5 keys, no other text.`;
     const parts = [];
 
     if (isVideo) {
-      // VIDEO ANALYSIS: Download and send video to Gemini
       try {
         console.log(`Fetching video for analysis: ${ad.video_url}`);
         const videoResponse = await fetch(ad.video_url);
@@ -702,12 +669,10 @@ Return ONLY valid JSON with these 5 keys, no other text.`;
           const base64Video = Buffer.from(videoBuffer).toString('base64');
           const contentType = videoResponse.headers.get('content-type') || 'video/mp4';
 
-          // Check size - Gemini inline limit is 20MB
           const sizeInMB = videoBuffer.byteLength / (1024 * 1024);
           console.log(`Video fetched: ${sizeInMB.toFixed(2)} MB, type: ${contentType}`);
 
           if (sizeInMB < 20) {
-            // Add video as inline data (per Gemini docs)
             parts.push({
               inlineData: {
                 mimeType: contentType,
@@ -717,7 +682,6 @@ Return ONLY valid JSON with these 5 keys, no other text.`;
             console.log('Video added as inline data for analysis');
           } else {
             console.log('Video too large for inline, falling back to thumbnail');
-            // Fall back to thumbnail image if video is too large
             if (ad.creative_url) {
               const imageResponse = await fetch(ad.creative_url);
               if (imageResponse.ok) {
@@ -735,7 +699,6 @@ Return ONLY valid JSON with these 5 keys, no other text.`;
         }
       } catch (videoError) {
         console.error('Failed to fetch video:', videoError.message);
-        // Fall back to thumbnail
         if (ad.creative_url) {
           try {
             const imageResponse = await fetch(ad.creative_url);
@@ -752,7 +715,6 @@ Return ONLY valid JSON with these 5 keys, no other text.`;
         }
       }
     } else {
-      // IMAGE ANALYSIS: Download and send image to Gemini
       if (ad.creative_url) {
         try {
           console.log(`Fetching image for analysis: ${ad.creative_url}`);
@@ -776,7 +738,6 @@ Return ONLY valid JSON with these 5 keys, no other text.`;
       }
     }
 
-    // Add the text prompt after the media (per Gemini docs best practice)
     parts.push({ text: prompt });
 
     const response = await fetch(
@@ -798,7 +759,6 @@ Return ONLY valid JSON with these 5 keys, no other text.`;
     const data = await response.json();
     const text = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
 
-    // Parse JSON from response
     const jsonMatch = text.match(/\{[\s\S]*\}/);
     if (jsonMatch) {
       return JSON.parse(jsonMatch[0]);
@@ -815,9 +775,7 @@ Return ONLY valid JSON with these 5 keys, no other text.`;
 // AD PROCESSING FUNCTIONS
 // ============================================
 
-// Transform Apify actor results to our internal format
 function transformApifyResults(apifyResults, brandId) {
-  // Helper to extract text from various body formats
   const extractBodyText = (body) => {
     if (!body) return '';
     if (typeof body === 'string') return body;
@@ -825,43 +783,34 @@ function transformApifyResults(apifyResults, brandId) {
     return '';
   };
 
-  // Helper to extract media fingerprint from URL
   const getMediaFingerprint = (url) => {
     if (!url) return '';
-    // Try to extract the unique file identifier from Facebook CDN URLs
-    // URLs look like: https://scontent-xxx.fbcdn.net/v/t39.35426-6/123456789_987654321...
     const match = url.match(/\/(\d{10,}_\d+[^\/\?]*)/);
     if (match) return match[1];
-    // Fallback: use last 150 chars which are more likely to be unique
     return url.slice(-150);
   };
 
-  // First pass: dedupe by adArchiveID (remove exact duplicates)
   const seenIds = new Set();
   const uniqueById = apifyResults.filter(item => {
     const adId = item.adArchiveID || item.adArchiveId || item.adid;
-    if (!adId) return true; // Keep items without ID
+    if (!adId) return true;
     if (seenIds.has(adId)) return false;
     seenIds.add(adId);
     return true;
   });
   console.log(`ID dedup: ${apifyResults.length} -> ${uniqueById.length} ads`);
 
-  // Second pass: dedupe by media (same video/image = same creative, keep oldest)
-  // Only group by media if we actually have a media URL
   const mediaGrouped = new Map();
 
   for (const item of uniqueById) {
     const snapshot = item.snapshot || {};
 
-    // Get media fingerprint
     const firstVideo = snapshot.videos?.[0];
     const videoUrl = firstVideo?.video_hd_url || firstVideo?.video_sd_url || '';
     const firstImage = snapshot.images?.[0];
     const imageUrl = typeof firstImage === 'string' ? firstImage : (firstImage?.resizedImageUrl || firstImage?.url || '');
     const mediaFingerprint = getMediaFingerprint(videoUrl || imageUrl);
 
-    // Get start date for comparison (keep oldest)
     let startTimestamp = 0;
     if (item.startDateFormatted) {
       startTimestamp = new Date(item.startDateFormatted).getTime();
@@ -869,8 +818,6 @@ function transformApifyResults(apifyResults, brandId) {
       startTimestamp = item.startDate * 1000;
     }
 
-    // Only dedupe by media if we have a valid media fingerprint
-    // Otherwise keep the ad as unique (don't dedupe by headline alone)
     if (mediaFingerprint) {
       const key = `media:${mediaFingerprint}`;
       const existing = mediaGrouped.get(key);
@@ -878,7 +825,6 @@ function transformApifyResults(apifyResults, brandId) {
         mediaGrouped.set(key, { item, startTimestamp });
       }
     } else {
-      // No media - keep as unique (use adArchiveID or index as key)
       const adId = item.adArchiveID || item.adArchiveId || item.adid || `unique_${Date.now()}_${Math.random()}`;
       mediaGrouped.set(`id:${adId}`, { item, startTimestamp });
     }
@@ -887,9 +833,6 @@ function transformApifyResults(apifyResults, brandId) {
   const afterMediaDedup = Array.from(mediaGrouped.values()).map(v => v.item);
   console.log(`Media dedup: ${uniqueById.length} -> ${afterMediaDedup.length} ads`);
 
-  // Third pass: dedupe by headline within same brand
-  // This catches cases like AG1 where same ad runs multiple times with different adArchiveIDs
-  // but identical headline (unlike Perfect Jean which has different headlines per ad)
   const headlineGrouped = new Map();
 
   for (const item of afterMediaDedup) {
@@ -899,7 +842,6 @@ function transformApifyResults(apifyResults, brandId) {
 
     const headline = (firstCard.title || snapshot.title || snapshot.link_description || '').trim().toLowerCase();
 
-    // Get start date for comparison (keep oldest)
     let startTimestamp = 0;
     if (item.startDateFormatted) {
       startTimestamp = new Date(item.startDateFormatted).getTime();
@@ -907,7 +849,6 @@ function transformApifyResults(apifyResults, brandId) {
       startTimestamp = item.startDate * 1000;
     }
 
-    // Group by headline - if same headline, keep the oldest version
     if (headline) {
       const key = `headline:${headline}`;
       const existing = headlineGrouped.get(key);
@@ -915,7 +856,6 @@ function transformApifyResults(apifyResults, brandId) {
         headlineGrouped.set(key, { item, startTimestamp });
       }
     } else {
-      // No headline - keep as unique
       const adId = item.adArchiveID || item.adArchiveId || item.adid || `unique_${Date.now()}_${Math.random()}`;
       headlineGrouped.set(`id:${adId}`, { item, startTimestamp });
     }
@@ -924,31 +864,24 @@ function transformApifyResults(apifyResults, brandId) {
   const uniqueResults = Array.from(headlineGrouped.values()).map(v => v.item);
   console.log(`Headline dedup: ${afterMediaDedup.length} -> ${uniqueResults.length} ads`);
 
-  // Limit to top 20 unique ads
   const top20Unique = uniqueResults.slice(0, 20);
   console.log(`Keeping top ${top20Unique.length} of ${uniqueResults.length} unique ads`);
 
   return top20Unique.map((item, index) => {
-    // The actor returns: adArchiveID, snapshot.cards[], startDate, etc.
     const adId = item.adArchiveID || item.adArchiveId || item.adid || `apify_${Date.now()}_${index}`;
 
-    // Get snapshot and cards
     const snapshot = item.snapshot || {};
     const cards = snapshot.cards || [];
     const firstCard = cards[0] || {};
 
-    // Extract creative URL (image or video) - using correct field names from Apify
-    // The Apify response may have URLs directly as strings or nested in objects
-    let creativeUrl = null;  // For display (thumbnail for videos, image for images)
-    let videoUrl = null;     // Actual video URL for video analysis
+    let creativeUrl = null;
+    let videoUrl = null;
     let creativeType = 'image';
 
-    // Helper to extract string URL from potentially nested structure
     const extractUrl = (val) => {
       if (!val) return null;
       if (typeof val === 'string') return val;
       if (typeof val === 'object') {
-        // Try common URL property names (both camelCase and snake_case)
         return val.videoHdUrl || val.video_hd_url ||
                val.videoSdUrl || val.video_sd_url ||
                val.videoPreviewImageUrl || val.video_preview_image_url ||
@@ -959,7 +892,6 @@ function transformApifyResults(apifyResults, brandId) {
       return null;
     };
 
-    // Helper to extract preview image URL from video object
     const extractVideoPreviewUrl = (videoObj) => {
       if (!videoObj) return null;
       if (typeof videoObj === 'object') {
@@ -968,32 +900,23 @@ function transformApifyResults(apifyResults, brandId) {
       return null;
     };
 
-    // Check for video first (camelCase field names from Apify)
     if (firstCard.videoHdUrl || firstCard.videoSdUrl) {
-      // Store the actual video URL for AI analysis
       videoUrl = extractUrl(firstCard.videoHdUrl) || extractUrl(firstCard.videoSdUrl);
-      // Use the preview image for display in the grid (thumbnail)
       creativeUrl = extractUrl(firstCard.videoPreviewImageUrl) || extractUrl(firstCard.resizedImageUrl) || extractUrl(firstCard.originalImageUrl);
       creativeType = 'video';
     } else if (firstCard.resizedImageUrl || firstCard.originalImageUrl) {
-      // Image URLs (camelCase)
       creativeUrl = extractUrl(firstCard.resizedImageUrl) || extractUrl(firstCard.originalImageUrl);
       creativeType = 'image';
     } else if (snapshot.videos && snapshot.videos.length > 0) {
-      // Fallback to snapshot.videos array - video objects contain video_hd_url, video_sd_url, video_preview_image_url
       const firstVideo = snapshot.videos[0];
       videoUrl = extractUrl(firstVideo);
-      // Extract preview image from the video object itself, or fall back to snapshot.images
       creativeUrl = extractVideoPreviewUrl(firstVideo) || extractUrl(snapshot.images?.[0]) || null;
       creativeType = 'video';
     } else if (snapshot.images && snapshot.images.length > 0) {
-      // Fallback to snapshot.images array
       creativeUrl = extractUrl(snapshot.images[0]);
     }
-    
-    // Additional fallbacks - try to find any media URL in the item
+
     if (!creativeUrl && !videoUrl) {
-      // Check for direct image/video URLs on the item or snapshot
       const possibleMediaFields = [
         item.imageUrl, item.image_url, item.thumbnailUrl, item.thumbnail_url,
         item.mediaUrl, item.media_url, item.previewUrl, item.preview_url,
@@ -1001,24 +924,22 @@ function transformApifyResults(apifyResults, brandId) {
         snapshot.mediaUrl, snapshot.media_url, snapshot.previewUrl, snapshot.preview_url,
         firstCard.imageUrl, firstCard.image_url, firstCard.thumbnailUrl, firstCard.thumbnail_url
       ];
-      
+
       for (const field of possibleMediaFields) {
         if (field && typeof field === 'string' && field.startsWith('http')) {
           creativeUrl = field;
           break;
         }
       }
-      
-      // Log if we still can't find media (for debugging)
+
       if (!creativeUrl) {
-        console.log(`No media found for ad ${adId}. Available fields:`, 
-          Object.keys(snapshot).join(', '), 
+        console.log(`No media found for ad ${adId}. Available fields:`,
+          Object.keys(snapshot).join(', '),
           '| cards[0] fields:', Object.keys(firstCard).join(', ')
         );
       }
     }
 
-    // Final safety check - ensure URLs are strings
     if (creativeUrl && typeof creativeUrl !== 'string') {
       console.error('creativeUrl is not a string:', creativeUrl);
       creativeUrl = null;
@@ -1028,7 +949,6 @@ function transformApifyResults(apifyResults, brandId) {
       videoUrl = null;
     }
 
-    // Extract ad copy/text - ensure we get a string, not an object
     let adCopy = '';
     if (typeof firstCard.body === 'string') {
       adCopy = firstCard.body;
@@ -1042,20 +962,15 @@ function transformApifyResults(apifyResults, brandId) {
     const headline = firstCard.title || snapshot.title || '';
     const ctaType = firstCard.ctaText || firstCard.ctaType || snapshot.ctaText || '';
 
-    // Extract start date (when the ad started running)
-    // Apify provides startDate as Unix timestamp and startDateFormatted as ISO string
     let startDate = null;
     if (item.startDateFormatted) {
-      // Use the formatted date directly (e.g., "2025-08-18T07:00:00.000Z")
       startDate = item.startDateFormatted.split('T')[0];
     } else if (typeof item.startDate === 'number') {
-      // Convert Unix timestamp to date
       startDate = new Date(item.startDate * 1000).toISOString().split('T')[0];
     } else if (item.startDate) {
       startDate = item.startDate;
     }
 
-    // Build Ad Library link
     const adLibraryLink = `https://www.facebook.com/ads/library/?id=${adId}`;
 
     return {
@@ -1064,13 +979,12 @@ function transformApifyResults(apifyResults, brandId) {
       rank: index + 1,
       creative_type: creativeType,
       creative_url: creativeUrl,
-      video_url: videoUrl,  // Actual video URL for video ads
+      video_url: videoUrl,
       ad_copy: adCopy,
       headline: headline,
       cta_type: ctaType,
       start_date: startDate,
       ad_library_link: adLibraryLink,
-      // AI fields will be populated later
       ai_format: null,
       ai_hook: null,
       ai_visual_style: null,
@@ -1079,10 +993,13 @@ function transformApifyResults(apifyResults, brandId) {
   });
 }
 
-function processScrapedAds(brandId, scrapedAds) {
-  // Verify brand exists before processing
-  const brand = db.prepare('SELECT id FROM brands WHERE id = ?').get(brandId);
-  if (!brand) {
+async function processScrapedAds(brandId, scrapedAds) {
+  const brandResult = await db.execute({
+    sql: 'SELECT id FROM brands WHERE id = ?',
+    args: [brandId]
+  });
+
+  if (brandResult.rows.length === 0) {
     console.error(`Brand ${brandId} not found in database, skipping ad processing`);
     return [];
   }
@@ -1090,61 +1007,62 @@ function processScrapedAds(brandId, scrapedAds) {
   const weekStart = getWeekStart();
   const today = new Date().toISOString().split('T')[0];
 
-  // Get the ad_ids from the new scrape
   const newAdIds = scrapedAds.map(ad => ad.ad_id);
 
-  // Delete old ads for this brand that aren't in the new top 20
-  // BUT preserve bookmarked ads - users explicitly saved those
   if (newAdIds.length > 0) {
     const placeholders = newAdIds.map(() => '?').join(',');
-    
-    // First, get the ad_ids that will be deleted
-    const adsToDelete = db.prepare(`
-      SELECT ad_id FROM ad_vault 
-      WHERE brand_id = ? AND ad_id NOT IN (${placeholders}) AND (bookmarked = 0 OR bookmarked IS NULL)
-    `).all(brandId, ...newAdIds);
-    
-    // Delete references from weekly_snapshots first (foreign key constraint)
+
+    const adsToDeleteResult = await db.execute({
+      sql: `SELECT ad_id FROM ad_vault
+            WHERE brand_id = ? AND ad_id NOT IN (${placeholders}) AND (bookmarked = 0 OR bookmarked IS NULL)`,
+      args: [brandId, ...newAdIds]
+    });
+    const adsToDelete = adsToDeleteResult.rows;
+
     if (adsToDelete.length > 0) {
       const deleteIds = adsToDelete.map(a => a.ad_id);
       const deletePlaceholders = deleteIds.map(() => '?').join(',');
-      db.prepare(`DELETE FROM weekly_snapshots WHERE ad_id IN (${deletePlaceholders})`).run(...deleteIds);
+      await db.execute({
+        sql: `DELETE FROM weekly_snapshots WHERE ad_id IN (${deletePlaceholders})`,
+        args: deleteIds
+      });
     }
-    
-    // Now safe to delete from ad_vault
-    const deleted = db.prepare(`
-      DELETE FROM ad_vault
-      WHERE brand_id = ? AND ad_id NOT IN (${placeholders}) AND (bookmarked = 0 OR bookmarked IS NULL)
-    `).run(brandId, ...newAdIds);
-    console.log(`Cleaned up ${deleted.changes} old ads for brand ${brandId} (preserved bookmarked ads)`);
+
+    const deleted = await db.execute({
+      sql: `DELETE FROM ad_vault
+            WHERE brand_id = ? AND ad_id NOT IN (${placeholders}) AND (bookmarked = 0 OR bookmarked IS NULL)`,
+      args: [brandId, ...newAdIds]
+    });
+    console.log(`Cleaned up ${deleted.rowsAffected} old ads for brand ${brandId} (preserved bookmarked ads)`);
   }
 
   const processedAds = [];
 
   for (const ad of scrapedAds) {
-    // Check if ad already exists
-    const existing = db.prepare('SELECT * FROM ad_vault WHERE ad_id = ?').get(ad.ad_id);
+    const existingResult = await db.execute({
+      sql: 'SELECT * FROM ad_vault WHERE ad_id = ?',
+      args: [ad.ad_id]
+    });
+    const existing = existingResult.rows[0];
 
     if (existing) {
-      // Update existing ad - increment weeks_in_top10 if new week
-      // Parse date string as local date (not UTC) by using YYYY-MM-DD with T00:00:00
       const lastSeenDate = existing.last_seen ? new Date(existing.last_seen + 'T00:00:00') : null;
       const lastWeek = lastSeenDate ? getWeekStart(lastSeenDate) : null;
       const weeksInTop10 = (lastWeek && lastWeek !== weekStart) ? existing.weeks_in_top10 + 1 : existing.weeks_in_top10;
 
-      db.prepare(`
-        UPDATE ad_vault
-        SET last_seen = ?, rank = ?, weeks_in_top10 = ?,
-            creative_url = COALESCE(?, creative_url),
-            creative_type = COALESCE(?, creative_type),
-            video_url = COALESCE(?, video_url),
-            updated_at = CURRENT_TIMESTAMP
-        WHERE ad_id = ?
-      `).run(today, ad.rank, weeksInTop10, ad.creative_url, ad.creative_type, ad.video_url, ad.ad_id);
+      await db.execute({
+        sql: `UPDATE ad_vault
+              SET last_seen = ?, rank = ?, weeks_in_top10 = ?,
+                  creative_url = COALESCE(?, creative_url),
+                  creative_type = COALESCE(?, creative_type),
+                  video_url = COALESCE(?, video_url),
+                  updated_at = CURRENT_TIMESTAMP
+              WHERE ad_id = ?`,
+        args: [today, ad.rank, weeksInTop10, ad.creative_url, ad.creative_type, ad.video_url, ad.ad_id]
+      });
 
       processedAds.push({ ...existing, rank: ad.rank, last_seen: today, weeks_in_top10: weeksInTop10, isNew: false });
     } else {
-      // Insert new ad - ensure all values are primitives
       const adValues = {
         ad_id: String(ad.ad_id || ''),
         brand_id: brandId,
@@ -1164,7 +1082,6 @@ function processScrapedAds(brandId, scrapedAds) {
         ai_angle: ad.ai_angle || null
       };
 
-      // Debug: check for any object values
       const allParams = [
         adValues.ad_id, adValues.brand_id, adValues.date_scraped, adValues.rank,
         adValues.creative_type, adValues.creative_url, adValues.video_url,
@@ -1181,27 +1098,30 @@ function processScrapedAds(brandId, scrapedAds) {
         }
       }
 
-      const result = db.prepare(`
-        INSERT INTO ad_vault (
-          ad_id, brand_id, date_scraped, rank, creative_type, creative_url, video_url,
-          ad_copy, headline, cta_type, start_date, ad_library_link,
-          ai_format, ai_hook, ai_visual_style, ai_angle,
-          first_seen, last_seen, weeks_in_top10
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(...allParams);
+      const result = await db.execute({
+        sql: `INSERT INTO ad_vault (
+                ad_id, brand_id, date_scraped, rank, creative_type, creative_url, video_url,
+                ad_copy, headline, cta_type, start_date, ad_library_link,
+                ai_format, ai_hook, ai_visual_style, ai_angle,
+                first_seen, last_seen, weeks_in_top10
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        args: allParams
+      });
 
       processedAds.push({ ...ad, id: result.lastInsertRowid, first_seen: today, last_seen: today, isNew: true });
     }
 
-    // Record in weekly snapshot
-    db.prepare(`
-      INSERT OR REPLACE INTO weekly_snapshots (brand_id, ad_id, week_start, rank)
-      VALUES (?, ?, ?, ?)
-    `).run(brandId, ad.ad_id, weekStart, ad.rank);
+    await db.execute({
+      sql: `INSERT OR REPLACE INTO weekly_snapshots (brand_id, ad_id, week_start, rank)
+            VALUES (?, ?, ?, ?)`,
+      args: [brandId, ad.ad_id, weekStart, ad.rank]
+    });
   }
 
-  // Update brand's last_scraped timestamp
-  db.prepare('UPDATE brands SET last_scraped = CURRENT_TIMESTAMP WHERE id = ?').run(brandId);
+  await db.execute({
+    sql: 'UPDATE brands SET last_scraped = CURRENT_TIMESTAMP WHERE id = ?',
+    args: [brandId]
+  });
 
   return processedAds;
 }
@@ -1218,19 +1138,18 @@ app.get('/', (req, res) => {
 // ROUTES - BRANDS API
 // ============================================
 
-app.get('/api/brands', (req, res) => {
+app.get('/api/brands', async (req, res) => {
   try {
-    let brands = db.prepare(`
+    const result = await db.execute(`
       SELECT b.*,
         (SELECT COUNT(*) FROM ad_vault WHERE brand_id = b.id) as ad_count,
         (SELECT COUNT(*) FROM ad_vault WHERE brand_id = b.id AND weeks_in_top10 >= 4) as evergreen_count
       FROM brands b
       WHERE b.status = 'active'
       ORDER BY b.brand_name
-    `).all();
+    `);
 
-    // Return actual brands (empty array if none exist)
-    res.json(brands);
+    res.json(result.rows);
   } catch (error) {
     console.error('Get brands error:', error);
     res.status(500).json({ error: 'Failed to get brands' });
@@ -1245,29 +1164,33 @@ app.post('/api/brands', async (req, res) => {
       return res.status(400).json({ error: 'Brand name and Ad Library URL are required' });
     }
 
-    // Extract page_id from Ad Library URL
     const pageIdMatch = ad_library_url.match(/view_all_page_id=(\d+)/);
     if (!pageIdMatch) {
       return res.status(400).json({ error: 'Could not extract Page ID from Ad Library URL. Make sure the URL contains view_all_page_id=' });
     }
     const page_id = pageIdMatch[1];
 
-    const result = db.prepare(`
-      INSERT INTO brands (brand_name, website_url, fb_page_url, page_id, vertical)
-      VALUES (?, ?, ?, ?, ?)
-    `).run(brand_name, website_url, ad_library_url, page_id, vertical);
+    const result = await db.execute({
+      sql: `INSERT INTO brands (brand_name, website_url, fb_page_url, page_id, vertical)
+            VALUES (?, ?, ?, ?, ?)`,
+      args: [brand_name, website_url, ad_library_url, page_id, vertical]
+    });
 
     const brandId = result.lastInsertRowid;
 
-    // Automatically trigger initial scrape for the new brand
-    const brand = db.prepare('SELECT * FROM brands WHERE id = ?').get(brandId);
+    const brandResult = await db.execute({
+      sql: 'SELECT * FROM brands WHERE id = ?',
+      args: [brandId]
+    });
+    const brand = brandResult.rows[0];
+
     if (brand) {
       console.log(`Auto-scraping new brand: ${brand_name}`);
       const scrapeResult = await startAdLibraryScrape(brand);
       res.json({
         success: true,
         id: brandId,
-        brandId: brandId,  // Include brandId explicitly for frontend scraping status
+        brandId: brandId,
         page_id,
         scrapeJobId: scrapeResult.jobId,
         message: 'Brand created and scrape started'
@@ -1281,21 +1204,22 @@ app.post('/api/brands', async (req, res) => {
   }
 });
 
-app.put('/api/brands/:id', (req, res) => {
+app.put('/api/brands/:id', async (req, res) => {
   try {
     const { brand_name, website_url, fb_page_url, page_id, vertical, status } = req.body;
 
-    db.prepare(`
-      UPDATE brands
-      SET brand_name = COALESCE(?, brand_name),
-          website_url = COALESCE(?, website_url),
-          fb_page_url = COALESCE(?, fb_page_url),
-          page_id = COALESCE(?, page_id),
-          vertical = COALESCE(?, vertical),
-          status = COALESCE(?, status),
-          updated_at = CURRENT_TIMESTAMP
-      WHERE id = ?
-    `).run(brand_name, website_url, fb_page_url, page_id, vertical, status, req.params.id);
+    await db.execute({
+      sql: `UPDATE brands
+            SET brand_name = COALESCE(?, brand_name),
+                website_url = COALESCE(?, website_url),
+                fb_page_url = COALESCE(?, fb_page_url),
+                page_id = COALESCE(?, page_id),
+                vertical = COALESCE(?, vertical),
+                status = COALESCE(?, status),
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?`,
+      args: [brand_name, website_url, fb_page_url, page_id, vertical, status, req.params.id]
+    });
 
     res.json({ success: true });
   } catch (error) {
@@ -1304,17 +1228,26 @@ app.put('/api/brands/:id', (req, res) => {
   }
 });
 
-app.delete('/api/brands/:id', (req, res) => {
+app.delete('/api/brands/:id', async (req, res) => {
   try {
     const brandId = req.params.id;
 
-    // Delete associated data first (foreign key references)
-    db.prepare('DELETE FROM weekly_snapshots WHERE brand_id = ?').run(brandId);
-    db.prepare('DELETE FROM ad_vault WHERE brand_id = ?').run(brandId);
-    db.prepare('DELETE FROM scrape_jobs WHERE brand_id = ?').run(brandId);
-
-    // Then delete the brand itself
-    db.prepare('DELETE FROM brands WHERE id = ?').run(brandId);
+    await db.execute({
+      sql: 'DELETE FROM weekly_snapshots WHERE brand_id = ?',
+      args: [brandId]
+    });
+    await db.execute({
+      sql: 'DELETE FROM ad_vault WHERE brand_id = ?',
+      args: [brandId]
+    });
+    await db.execute({
+      sql: 'DELETE FROM scrape_jobs WHERE brand_id = ?',
+      args: [brandId]
+    });
+    await db.execute({
+      sql: 'DELETE FROM brands WHERE id = ?',
+      args: [brandId]
+    });
 
     console.log(`Deleted brand ${brandId} and all associated data`);
     res.json({ success: true });
@@ -1326,7 +1259,11 @@ app.delete('/api/brands/:id', (req, res) => {
 
 app.post('/api/brands/:id/resolve-page-id', async (req, res) => {
   try {
-    const brand = db.prepare('SELECT * FROM brands WHERE id = ?').get(req.params.id);
+    const result = await db.execute({
+      sql: 'SELECT * FROM brands WHERE id = ?',
+      args: [req.params.id]
+    });
+    const brand = result.rows[0];
 
     if (!brand) {
       return res.status(404).json({ error: 'Brand not found' });
@@ -1335,7 +1272,10 @@ app.post('/api/brands/:id/resolve-page-id', async (req, res) => {
     const pageId = await resolvePageId(brand.fb_page_url);
 
     if (pageId) {
-      db.prepare('UPDATE brands SET page_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(pageId, brand.id);
+      await db.execute({
+        sql: 'UPDATE brands SET page_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
+        args: [pageId, brand.id]
+      });
       res.json({ success: true, pageId });
     } else {
       res.status(400).json({ error: 'Could not resolve Page ID. Try entering it manually.' });
@@ -1350,7 +1290,7 @@ app.post('/api/brands/:id/resolve-page-id', async (req, res) => {
 // ROUTES - ADS API
 // ============================================
 
-app.get('/api/ads', (req, res) => {
+app.get('/api/ads', async (req, res) => {
   try {
     const {
       brand_ids, evergreen_only, min_weeks, date_from, date_to, media_type, sort = 'newest', limit = 50, offset = 0,
@@ -1365,7 +1305,6 @@ app.get('/api/ads', (req, res) => {
     `;
     const params = [];
 
-    // Support multiple brand IDs (brand_ids can be a single value or array)
     const brandIdArray = brand_ids ? (Array.isArray(brand_ids) ? brand_ids : [brand_ids]) : [];
     if (brandIdArray.length > 0) {
       const placeholders = brandIdArray.map(() => '?').join(',');
@@ -1373,7 +1312,6 @@ app.get('/api/ads', (req, res) => {
       params.push(...brandIdArray);
     }
 
-    // Filter by start_date range (when the ad started running)
     if (date_from) {
       query += ' AND a.start_date >= ?';
       params.push(date_from);
@@ -1384,13 +1322,11 @@ app.get('/api/ads', (req, res) => {
       params.push(date_to);
     }
 
-    // Filter by media type (video or image)
     if (media_type) {
       query += ' AND a.creative_type = ?';
       params.push(media_type);
     }
 
-    // AI tag filters - support multiple values per category
     const aiFilters = [
       { param: ai_asset_type, column: 'ai_asset_type' },
       { param: ai_visual_format, column: 'ai_visual_format' },
@@ -1408,16 +1344,13 @@ app.get('/api/ads', (req, res) => {
       }
     }
 
-    // Keep evergreen/min_weeks filter for the Evergreen view
     if (evergreen_only === 'true' || min_weeks) {
       const weeks = min_weeks ? parseInt(min_weeks) : 4;
       query += ' AND a.weeks_in_top10 >= ?';
       params.push(weeks);
     }
 
-    // Sort order - rank sorts by impression ranking, date sorts by start_date
     if (sort === 'rank') {
-      // Sort by rank (1 = highest impressions) then by date for ties
       query += ` ORDER BY a.rank ASC, a.start_date DESC LIMIT ? OFFSET ?`;
     } else {
       const sortDirection = sort === 'oldest' ? 'ASC' : 'DESC';
@@ -1426,48 +1359,50 @@ app.get('/api/ads', (req, res) => {
     params.push(parseInt(limit));
     params.push(parseInt(offset));
 
-    let ads = db.prepare(query).all(...params);
+    const result = await db.execute({
+      sql: query,
+      args: params
+    });
 
-    // Return actual results (empty array if no matches - no mock data fallback)
-    res.json(ads);
+    res.json(result.rows);
   } catch (error) {
     console.error('Get ads error:', error);
     res.status(500).json({ error: 'Failed to get ads' });
   }
 });
 
-// Get all bookmarked ads - MUST be before /api/ads/:id to avoid route conflict
-app.get('/api/ads/bookmarked', (req, res) => {
+app.get('/api/ads/bookmarked', async (req, res) => {
   try {
-    const ads = db.prepare(`
+    const result = await db.execute(`
       SELECT a.*, b.brand_name, b.vertical
       FROM ad_vault a
       JOIN brands b ON a.brand_id = b.id
       WHERE a.bookmarked = 1
       ORDER BY a.updated_at DESC
-    `).all();
+    `);
 
-    res.json(ads);
+    res.json(result.rows);
   } catch (error) {
     console.error('Get bookmarked ads error:', error);
     res.status(500).json({ error: 'Failed to get bookmarked ads' });
   }
 });
 
-app.get('/api/ads/:id', (req, res) => {
+app.get('/api/ads/:id', async (req, res) => {
   try {
-    const ad = db.prepare(`
-      SELECT a.*, b.brand_name, b.vertical, b.website_url
-      FROM ad_vault a
-      JOIN brands b ON a.brand_id = b.id
-      WHERE a.id = ?
-    `).get(req.params.id);
+    const result = await db.execute({
+      sql: `SELECT a.*, b.brand_name, b.vertical, b.website_url
+            FROM ad_vault a
+            JOIN brands b ON a.brand_id = b.id
+            WHERE a.id = ?`,
+      args: [req.params.id]
+    });
 
-    if (!ad) {
+    if (result.rows.length === 0) {
       return res.status(404).json({ error: 'Ad not found' });
     }
 
-    res.json(ad);
+    res.json(result.rows[0]);
   } catch (error) {
     console.error('Get ad error:', error);
     res.status(500).json({ error: 'Failed to get ad' });
@@ -1476,7 +1411,11 @@ app.get('/api/ads/:id', (req, res) => {
 
 app.post('/api/ads/:id/analyze', async (req, res) => {
   try {
-    const ad = db.prepare('SELECT * FROM ad_vault WHERE id = ?').get(req.params.id);
+    const result = await db.execute({
+      sql: 'SELECT * FROM ad_vault WHERE id = ?',
+      args: [req.params.id]
+    });
+    const ad = result.rows[0];
 
     if (!ad) {
       return res.status(404).json({ error: 'Ad not found' });
@@ -1484,22 +1423,22 @@ app.post('/api/ads/:id/analyze', async (req, res) => {
 
     const analysis = await analyzeAdCreative(ad);
 
-    // Update ad with new expanded AI tag fields
-    db.prepare(`
-      UPDATE ad_vault
-      SET ai_asset_type = ?, ai_visual_format = ?, ai_messaging_angle = ?,
-          ai_hook_tactic = ?, ai_offer_type = ?,
-          ai_raw_response = ?, updated_at = CURRENT_TIMESTAMP
-      WHERE id = ?
-    `).run(
-      analysis.asset_type,
-      analysis.visual_format,
-      analysis.messaging_angle,
-      analysis.hook_tactic,
-      analysis.offer_type,
-      JSON.stringify(analysis),
-      ad.id
-    );
+    await db.execute({
+      sql: `UPDATE ad_vault
+            SET ai_asset_type = ?, ai_visual_format = ?, ai_messaging_angle = ?,
+                ai_hook_tactic = ?, ai_offer_type = ?,
+                ai_raw_response = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?`,
+      args: [
+        analysis.asset_type,
+        analysis.visual_format,
+        analysis.messaging_angle,
+        analysis.hook_tactic,
+        analysis.offer_type,
+        JSON.stringify(analysis),
+        ad.id
+      ]
+    });
 
     res.json(analysis);
   } catch (error) {
@@ -1508,29 +1447,27 @@ app.post('/api/ads/:id/analyze', async (req, res) => {
   }
 });
 
-// Get count of unanalyzed ads
-app.get('/api/ads/unanalyzed/count', (req, res) => {
+app.get('/api/ads/unanalyzed/count', async (req, res) => {
   try {
-    const result = db.prepare(`
+    const result = await db.execute(`
       SELECT COUNT(*) as count FROM ad_vault
       WHERE ai_asset_type IS NULL OR ai_asset_type = ''
-    `).get();
-    res.json({ count: result.count });
+    `);
+    res.json({ count: result.rows[0].count });
   } catch (error) {
     console.error('Get unanalyzed count error:', error);
     res.status(500).json({ error: 'Failed to get count' });
   }
 });
 
-// Batch analyze unanalyzed ads
 app.post('/api/ads/analyze-batch', async (req, res) => {
   try {
-    // Get all unanalyzed ads
-    const unanalyzedAds = db.prepare(`
+    const result = await db.execute(`
       SELECT * FROM ad_vault
       WHERE ai_asset_type IS NULL OR ai_asset_type = ''
       ORDER BY created_at DESC
-    `).all();
+    `);
+    const unanalyzedAds = result.rows;
 
     if (unanalyzedAds.length === 0) {
       return res.json({ analyzed: 0, message: 'No unanalyzed ads found' });
@@ -1545,26 +1482,26 @@ app.post('/api/ads/analyze-batch', async (req, res) => {
       try {
         const analysis = await analyzeAdCreative(ad);
 
-        db.prepare(`
-          UPDATE ad_vault
-          SET ai_asset_type = ?, ai_visual_format = ?, ai_messaging_angle = ?,
-              ai_hook_tactic = ?, ai_offer_type = ?,
-              ai_raw_response = ?, updated_at = CURRENT_TIMESTAMP
-          WHERE id = ?
-        `).run(
-          analysis.asset_type,
-          analysis.visual_format,
-          analysis.messaging_angle,
-          analysis.hook_tactic,
-          analysis.offer_type,
-          JSON.stringify(analysis),
-          ad.id
-        );
+        await db.execute({
+          sql: `UPDATE ad_vault
+                SET ai_asset_type = ?, ai_visual_format = ?, ai_messaging_angle = ?,
+                    ai_hook_tactic = ?, ai_offer_type = ?,
+                    ai_raw_response = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?`,
+          args: [
+            analysis.asset_type,
+            analysis.visual_format,
+            analysis.messaging_angle,
+            analysis.hook_tactic,
+            analysis.offer_type,
+            JSON.stringify(analysis),
+            ad.id
+          ]
+        });
 
         analyzed++;
         console.log(`Analyzed ${analyzed}/${unanalyzedAds.length}: Ad ${ad.id}`);
 
-        // Small delay to avoid rate limiting
         await new Promise(resolve => setTimeout(resolve, 500));
       } catch (err) {
         console.error(`Failed to analyze ad ${ad.id}:`, err.message);
@@ -1580,18 +1517,23 @@ app.post('/api/ads/analyze-batch', async (req, res) => {
   }
 });
 
-// Toggle bookmark status for an ad
-app.post('/api/ads/:id/bookmark', (req, res) => {
+app.post('/api/ads/:id/bookmark', async (req, res) => {
   try {
-    const ad = db.prepare('SELECT id, bookmarked FROM ad_vault WHERE id = ?').get(req.params.id);
+    const result = await db.execute({
+      sql: 'SELECT id, bookmarked FROM ad_vault WHERE id = ?',
+      args: [req.params.id]
+    });
+    const ad = result.rows[0];
 
     if (!ad) {
       return res.status(404).json({ error: 'Ad not found' });
     }
 
     const newStatus = ad.bookmarked ? 0 : 1;
-    db.prepare('UPDATE ad_vault SET bookmarked = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
-      .run(newStatus, ad.id);
+    await db.execute({
+      sql: 'UPDATE ad_vault SET bookmarked = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
+      args: [newStatus, ad.id]
+    });
 
     res.json({ bookmarked: newStatus === 1 });
   } catch (error) {
@@ -1606,7 +1548,11 @@ app.post('/api/ads/:id/bookmark', (req, res) => {
 
 app.post('/api/scrape/brand/:id', async (req, res) => {
   try {
-    const brand = db.prepare('SELECT * FROM brands WHERE id = ?').get(req.params.id);
+    const result = await db.execute({
+      sql: 'SELECT * FROM brands WHERE id = ?',
+      args: [req.params.id]
+    });
+    const brand = result.rows[0];
 
     if (!brand) {
       return res.status(404).json({ error: 'Brand not found' });
@@ -1616,8 +1562,8 @@ app.post('/api/scrape/brand/:id', async (req, res) => {
       return res.status(400).json({ error: 'Brand does not have a Page ID. Please resolve it first.' });
     }
 
-    const result = await startAdLibraryScrape(brand);
-    res.json(result);
+    const scrapeResult = await startAdLibraryScrape(brand);
+    res.json(scrapeResult);
   } catch (error) {
     console.error('Scrape brand error:', error);
     res.status(500).json({ error: 'Failed to start scrape' });
@@ -1626,12 +1572,15 @@ app.post('/api/scrape/brand/:id', async (req, res) => {
 
 app.post('/api/scrape/all', async (req, res) => {
   try {
-    const brands = db.prepare('SELECT * FROM brands WHERE status = ? AND page_id IS NOT NULL').all('active');
+    const result = await db.execute('SELECT * FROM brands WHERE status = ? AND page_id IS NOT NULL', {
+      args: ['active']
+    });
+    const brands = result.rows;
 
     const jobs = [];
     for (const brand of brands) {
-      const result = await startAdLibraryScrape(brand);
-      jobs.push({ brandId: brand.id, brandName: brand.brand_name, ...result });
+      const scrapeResult = await startAdLibraryScrape(brand);
+      jobs.push({ brandId: brand.id, brandName: brand.brand_name, ...scrapeResult });
     }
 
     res.json({ success: true, jobs });
@@ -1643,18 +1592,20 @@ app.post('/api/scrape/all', async (req, res) => {
 
 app.get('/api/scrape/status/:jobId', async (req, res) => {
   try {
-    const job = db.prepare('SELECT * FROM scrape_jobs WHERE id = ?').get(req.params.jobId);
+    const result = await db.execute({
+      sql: 'SELECT * FROM scrape_jobs WHERE id = ?',
+      args: [req.params.jobId]
+    });
+    const job = result.rows[0];
 
     if (!job) {
       return res.status(404).json({ error: 'Job not found' });
     }
 
-    // If already complete, return status
     if (job.status === 'complete' || job.status === 'error') {
       return res.json({ status: job.status, resultCount: job.result_count });
     }
 
-    // Poll Apify if running
     if (job.apify_run_id) {
       const apifyStatus = await pollApifyJob(job.apify_run_id);
       console.log(`Apify job ${job.apify_run_id} status: ${apifyStatus}`);
@@ -1663,36 +1614,33 @@ app.get('/api/scrape/status/:jobId', async (req, res) => {
         const apifyResults = await getApifyResults(job.apify_run_id);
         console.log(`Got ${apifyResults.length} results from Apify`);
 
-        // Transform Apify results to our format
         const transformedAds = transformApifyResults(apifyResults, job.brand_id);
+        const processedAds = await processScrapedAds(job.brand_id, transformedAds);
 
-        // Process and save to database
-        const processedAds = processScrapedAds(job.brand_id, transformedAds);
-
-        db.prepare(`
-          UPDATE scrape_jobs
-          SET status = 'complete', results = ?, result_count = ?, completed_at = CURRENT_TIMESTAMP
-          WHERE id = ?
-        `).run(JSON.stringify(processedAds), processedAds.length, job.id);
+        await db.execute({
+          sql: `UPDATE scrape_jobs
+                SET status = 'complete', results = ?, result_count = ?, completed_at = CURRENT_TIMESTAMP
+                WHERE id = ?`,
+          args: [JSON.stringify(processedAds), processedAds.length, job.id]
+        });
 
         return res.json({ status: 'complete', resultCount: processedAds.length });
       }
 
       if (apifyStatus === 'FAILED' || apifyStatus === 'ABORTED' || apifyStatus === 'TIMED-OUT') {
-        db.prepare(`
-          UPDATE scrape_jobs
-          SET status = 'error', error_message = ?, completed_at = CURRENT_TIMESTAMP
-          WHERE id = ?
-        `).run(`Apify job ${apifyStatus}`, job.id);
+        await db.execute({
+          sql: `UPDATE scrape_jobs
+                SET status = 'error', error_message = ?, completed_at = CURRENT_TIMESTAMP
+                WHERE id = ?`,
+          args: [`Apify job ${apifyStatus}`, job.id]
+        });
 
         return res.json({ status: 'error', error: `Job ${apifyStatus}` });
       }
 
-      // Job is still running (RUNNING, READY, etc.)
       return res.json({ status: 'running' });
     }
 
-    // No Apify run ID means mock mode - job should already be complete
     res.json({ status: job.status });
   } catch (error) {
     console.error('Status check error:', error);
@@ -1702,7 +1650,11 @@ app.get('/api/scrape/status/:jobId', async (req, res) => {
 
 app.get('/api/scrape/results/:jobId', async (req, res) => {
   try {
-    const job = db.prepare('SELECT * FROM scrape_jobs WHERE id = ?').get(req.params.jobId);
+    const result = await db.execute({
+      sql: 'SELECT * FROM scrape_jobs WHERE id = ?',
+      args: [req.params.jobId]
+    });
+    const job = result.rows[0];
 
     if (!job) {
       return res.status(404).json({ error: 'Job not found' });
@@ -1729,28 +1681,29 @@ app.get('/api/scrape/results/:jobId', async (req, res) => {
 // ROUTES - ANALYTICS API
 // ============================================
 
-app.get('/api/analytics/evergreen', (req, res) => {
+app.get('/api/analytics/evergreen', async (req, res) => {
   try {
     const { min_weeks = 4 } = req.query;
 
-    const ads = db.prepare(`
-      SELECT a.*, b.brand_name, b.vertical
-      FROM ad_vault a
-      JOIN brands b ON a.brand_id = b.id
-      WHERE a.weeks_in_top10 >= ?
-      ORDER BY a.weeks_in_top10 DESC, a.rank ASC
-    `).all(parseInt(min_weeks));
+    const result = await db.execute({
+      sql: `SELECT a.*, b.brand_name, b.vertical
+            FROM ad_vault a
+            JOIN brands b ON a.brand_id = b.id
+            WHERE a.weeks_in_top10 >= ?
+            ORDER BY a.weeks_in_top10 DESC, a.rank ASC`,
+      args: [parseInt(min_weeks)]
+    });
 
-    res.json(ads);
+    res.json(result.rows);
   } catch (error) {
     console.error('Evergreen analytics error:', error);
     res.status(500).json({ error: 'Failed to get evergreen ads' });
   }
 });
 
-app.get('/api/analytics/by-vertical', (req, res) => {
+app.get('/api/analytics/by-vertical', async (req, res) => {
   try {
-    const stats = db.prepare(`
+    const result = await db.execute(`
       SELECT
         b.vertical,
         COUNT(DISTINCT b.id) as brand_count,
@@ -1761,16 +1714,16 @@ app.get('/api/analytics/by-vertical', (req, res) => {
       WHERE b.status = 'active'
       GROUP BY b.vertical
       ORDER BY ad_count DESC
-    `).all();
+    `);
 
-    res.json(stats);
+    res.json(result.rows);
   } catch (error) {
     console.error('Vertical analytics error:', error);
     res.status(500).json({ error: 'Failed to get vertical stats' });
   }
 });
 
-app.get('/api/analytics/weekly-snapshot', (req, res) => {
+app.get('/api/analytics/weekly-snapshot', async (req, res) => {
   try {
     const { brand_id, weeks = 4 } = req.query;
 
@@ -1796,9 +1749,12 @@ app.get('/api/analytics/weekly-snapshot', (req, res) => {
 
     query += ' ORDER BY ws.week_start DESC, ws.rank ASC';
 
-    const snapshots = db.prepare(query).all(...params);
+    const result = await db.execute({
+      sql: query,
+      args: params
+    });
 
-    res.json(snapshots);
+    res.json(result.rows);
   } catch (error) {
     console.error('Weekly snapshot error:', error);
     res.status(500).json({ error: 'Failed to get weekly snapshots' });
@@ -1809,7 +1765,7 @@ app.get('/api/analytics/weekly-snapshot', (req, res) => {
 // ROUTES - IMPORT/EXPORT
 // ============================================
 
-app.post('/api/import/brands', (req, res) => {
+app.post('/api/import/brands', async (req, res) => {
   try {
     const { brands } = req.body;
 
@@ -1822,10 +1778,11 @@ app.post('/api/import/brands', (req, res) => {
 
     for (const brand of brands) {
       try {
-        const result = db.prepare(`
-          INSERT INTO brands (brand_name, website_url, fb_page_url, page_id, vertical)
-          VALUES (?, ?, ?, ?, ?)
-        `).run(brand.brand_name, brand.website_url, brand.fb_page_url, brand.page_id, brand.vertical);
+        const result = await db.execute({
+          sql: `INSERT INTO brands (brand_name, website_url, fb_page_url, page_id, vertical)
+                VALUES (?, ?, ?, ?, ?)`,
+          args: [brand.brand_name, brand.website_url, brand.fb_page_url, brand.page_id, brand.vertical]
+        });
 
         inserted.push({ id: result.lastInsertRowid, brand_name: brand.brand_name });
       } catch (e) {
@@ -1840,7 +1797,6 @@ app.post('/api/import/brands', (req, res) => {
   }
 });
 
-// Bulk CSV import for brands with page ID resolution
 app.post('/api/import/brands-csv', async (req, res) => {
   try {
     const { csv } = req.body;
@@ -1849,24 +1805,20 @@ app.post('/api/import/brands-csv', async (req, res) => {
       return res.status(400).json({ error: 'Expected CSV string in body' });
     }
 
-    // Parse CSV
     const lines = csv.trim().split('\n');
     const header = lines[0].split(',').map(h => h.trim());
 
-    // Validate header
     const requiredColumns = ['Brand Name', 'Category', 'Facebook Page URL'];
     const missingColumns = requiredColumns.filter(col => !header.includes(col));
     if (missingColumns.length > 0) {
       return res.status(400).json({ error: `Missing columns: ${missingColumns.join(', ')}` });
     }
 
-    // Map column indices
     const brandNameIdx = header.indexOf('Brand Name');
     const categoryIdx = header.indexOf('Category');
     const websiteIdx = header.indexOf('Website Domain');
     const fbUrlIdx = header.indexOf('Facebook Page URL');
 
-    // Category to vertical mapping
     const categoryMap = {
       'Health/Supplements': 'Health',
       'Health': 'Health',
@@ -1886,12 +1838,10 @@ app.post('/api/import/brands-csv', async (req, res) => {
     const errors = [];
     const skipped = [];
 
-    // Process each row (skip header)
     for (let i = 1; i < lines.length; i++) {
       const line = lines[i].trim();
       if (!line) continue;
 
-      // Handle CSV parsing (simple - assumes no commas in fields)
       const values = line.split(',').map(v => v.trim());
 
       const brandName = values[brandNameIdx];
@@ -1904,21 +1854,19 @@ app.post('/api/import/brands-csv', async (req, res) => {
         continue;
       }
 
-      // Check for duplicate
-      const existing = db.prepare('SELECT id FROM brands WHERE brand_name = ?').get(brandName);
-      if (existing) {
+      const existingResult = await db.execute({
+        sql: 'SELECT id FROM brands WHERE brand_name = ?',
+        args: [brandName]
+      });
+      if (existingResult.rows.length > 0) {
         skipped.push({ brand_name: brandName, reason: 'Already exists' });
         continue;
       }
 
-      // Map category to vertical
       const vertical = categoryMap[category] || 'Other';
-
-      // Construct website URL
       const websiteUrl = websiteDomain ? `https://${websiteDomain}` : '';
 
       try {
-        // Resolve page ID using ScrapeCreators API (by brand name)
         console.log(`Resolving page ID for ${brandName}...`);
         const pageId = await resolvePageIdByName(brandName);
 
@@ -1927,14 +1875,13 @@ app.post('/api/import/brands-csv', async (req, res) => {
           continue;
         }
 
-        // Construct proper Ad Library URL with impressions sorting
         const adLibraryUrl = `https://www.facebook.com/ads/library/?active_status=active&ad_type=all&country=US&is_targeted_country=false&media_type=all&search_type=page&sort_data[direction]=desc&sort_data[mode]=total_impressions&view_all_page_id=${pageId}`;
 
-        // Insert brand
-        const result = db.prepare(`
-          INSERT INTO brands (brand_name, website_url, fb_page_url, page_id, vertical, status)
-          VALUES (?, ?, ?, ?, ?, 'active')
-        `).run(brandName, websiteUrl, adLibraryUrl, pageId, vertical);
+        const result = await db.execute({
+          sql: `INSERT INTO brands (brand_name, website_url, fb_page_url, page_id, vertical, status)
+                VALUES (?, ?, ?, ?, ?, 'active')`,
+          args: [brandName, websiteUrl, adLibraryUrl, pageId, vertical]
+        });
 
         inserted.push({
           id: result.lastInsertRowid,
@@ -1945,7 +1892,6 @@ app.post('/api/import/brands-csv', async (req, res) => {
 
         console.log(`✓ Added ${brandName} (page_id: ${pageId})`);
 
-        // Small delay to avoid rate limiting from Facebook
         await new Promise(r => setTimeout(r, 500));
 
       } catch (e) {
@@ -1972,9 +1918,9 @@ app.post('/api/import/brands-csv', async (req, res) => {
   }
 });
 
-app.get('/api/export/ads', (req, res) => {
+app.get('/api/export/ads', async (req, res) => {
   try {
-    const ads = db.prepare(`
+    const result = await db.execute(`
       SELECT
         a.ad_id,
         b.brand_name,
@@ -1995,11 +1941,11 @@ app.get('/api/export/ads', (req, res) => {
       FROM ad_vault a
       JOIN brands b ON a.brand_id = b.id
       ORDER BY b.brand_name, a.rank
-    `).all();
+    `);
 
     res.setHeader('Content-Type', 'application/json');
     res.setHeader('Content-Disposition', 'attachment; filename=meta_ads_export.json');
-    res.json(ads);
+    res.json(result.rows);
   } catch (error) {
     console.error('Export ads error:', error);
     res.status(500).json({ error: 'Failed to export ads' });
@@ -2010,13 +1956,11 @@ app.get('/api/export/ads', (req, res) => {
 // SETTINGS API
 // ============================================
 
-// Test endpoint to manually trigger scheduled scrape (for testing only)
 app.post('/api/test/run-scheduled-scrape', async (req, res) => {
   try {
     console.log('Manual trigger of scheduled scrape...');
     res.json({ message: 'Scheduled scrape started. Check server logs for progress.' });
 
-    // Run asynchronously so we don't block the response
     runScheduledScrapeAll().catch(err => {
       console.error('Scheduled scrape error:', err);
     });
@@ -2026,13 +1970,11 @@ app.post('/api/test/run-scheduled-scrape', async (req, res) => {
   }
 });
 
-// Test endpoint to manually trigger batch analysis (for testing only)
 app.post('/api/test/run-batch-analysis', async (req, res) => {
   try {
     console.log('Manual trigger of batch analysis...');
     res.json({ message: 'Batch analysis started. Check server logs for progress.' });
 
-    // Run asynchronously
     runBatchAnalysis().catch(err => {
       console.error('Batch analysis error:', err);
     });
@@ -2042,10 +1984,9 @@ app.post('/api/test/run-batch-analysis', async (req, res) => {
   }
 });
 
-// Get schedule settings
-app.get('/api/settings/schedule', (req, res) => {
+app.get('/api/settings/schedule', async (req, res) => {
   try {
-    const settings = getScheduleSettings();
+    const settings = await getScheduleSettings();
     res.json(settings);
   } catch (error) {
     console.error('Get schedule settings error:', error);
@@ -2053,20 +1994,19 @@ app.get('/api/settings/schedule', (req, res) => {
   }
 });
 
-// Update schedule settings
-app.post('/api/settings/schedule', (req, res) => {
+app.post('/api/settings/schedule', async (req, res) => {
   try {
     const { enabled, day, hour, autoAnalyze } = req.body;
 
-    setSetting('schedule_enabled', enabled ? 'true' : 'false');
-    setSetting('schedule_day', String(day));
-    setSetting('schedule_hour', String(hour));
-    setSetting('auto_analyze', autoAnalyze ? 'true' : 'false');
+    await setSetting('schedule_enabled', enabled ? 'true' : 'false');
+    await setSetting('schedule_day', String(day));
+    await setSetting('schedule_hour', String(hour));
+    await setSetting('auto_analyze', autoAnalyze ? 'true' : 'false');
 
-    // Restart the scheduler with new settings
     setupScheduledScrape();
 
-    res.json({ success: true, settings: getScheduleSettings() });
+    const settings = await getScheduleSettings();
+    res.json({ success: true, settings });
   } catch (error) {
     console.error('Update schedule settings error:', error);
     res.status(500).json({ error: 'Failed to update settings' });
@@ -2077,9 +2017,15 @@ app.post('/api/settings/schedule', (req, res) => {
 // START SERVER
 // ============================================
 
-app.listen(PORT, () => {
-  console.log(`\n📊 Meta Ad Library Monitor running at http://localhost:${PORT}`);
-  console.log(`🔧 Mode: ${APIFY_TOKEN ? '✅ Live (Apify connected)' : '🔸 Demo (using mock data)'}`);
-  console.log(`🤖 AI: ${GEMINI_API_KEY ? '✅ Gemini connected' : '🔸 Mock analysis'}`);
-  console.log(`\n💡 Add APIFY_TOKEN and GEMINI_API_KEY to Secrets for live data\n`);
+startup().then(() => {
+  app.listen(PORT, () => {
+    console.log(`\n📊 Meta Ad Library Monitor running at http://localhost:${PORT}`);
+    console.log(`🔧 Mode: ${APIFY_TOKEN ? '✅ Live (Apify connected)' : '🔸 Demo (using mock data)'}`);
+    console.log(`🤖 AI: ${GEMINI_API_KEY ? '✅ Gemini connected' : '🔸 Mock analysis'}`);
+    console.log(`💾 Database: ${process.env.TURSO_DATABASE_URL ? '✅ Turso connected' : '🔸 Local file'}`);
+    console.log(`\n💡 Add APIFY_TOKEN, GEMINI_API_KEY, TURSO_DATABASE_URL and TURSO_AUTH_TOKEN to environment variables\n`);
+  });
+}).catch(err => {
+  console.error('Startup failed:', err);
+  process.exit(1);
 });

@@ -12,14 +12,49 @@ Monitor top-performing Facebook ads for 100+ DTC brands, sorted by impressions.
 
 ## Quick Start
 
-1. Click "Use Template" (or import the zip)
-2. Add your API keys in the Secrets tab:
-   - `APIFY_TOKEN` - Get from [apify.com](https://apify.com)
-   - `GEMINI_API_KEY` - Get from [ai.google.dev](https://ai.google.dev)
-3. Click "Run"
-4. Your tool is live!
+### Local Development
 
-**Note:** The app works with realistic mock data if you don't add API keys.
+1. Clone the repository
+2. Install dependencies:
+   ```bash
+   cd meta-ads-spy-replit
+   npm install
+   ```
+3. Set up Turso database (optional for local dev):
+   ```bash
+   # Install Turso CLI
+   curl -sSfL https://get.tur.so/install.sh | bash
+
+   # Create a database
+   turso db create meta-ads-spy
+
+   # Get your database URL
+   turso db show meta-ads-spy --url
+
+   # Create an auth token
+   turso db tokens create meta-ads-spy
+   ```
+4. Create a `.env` file (copy from `.env.example`) and add your credentials
+5. Run the server:
+   ```bash
+   npm start
+   ```
+6. Open http://localhost:3000
+
+**Note:** The app works with a local SQLite file and mock data if you don't add Turso/API keys.
+
+### Deploy to Vercel
+
+1. Push your code to GitHub
+2. Import the project in [Vercel](https://vercel.com)
+3. Add environment variables in Vercel project settings:
+   - `TURSO_DATABASE_URL` - Your Turso database URL (required)
+   - `TURSO_AUTH_TOKEN` - Your Turso auth token (required)
+   - `APIFY_TOKEN` - Get from [apify.com](https://apify.com) (optional)
+   - `GEMINI_API_KEY` - Get from [ai.google.dev](https://ai.google.dev) (optional)
+4. Deploy!
+
+**Important:** Vercel requires Turso (or another cloud database) because its serverless platform doesn't support file-based SQLite databases.
 
 ## Features
 
@@ -105,11 +140,14 @@ The Meta Ad Library requires numeric Page IDs, not vanity URLs. The app:
 ├── views/
 │   └── index.html     # Single-page app UI
 ├── db/
-│   └── meta_ads.db    # SQLite database (auto-created)
+│   └── meta_ads.db    # Local SQLite database (dev only, auto-created)
 ├── package.json       # Dependencies
-├── .replit            # Replit configuration
-└── replit.nix         # Environment setup
+├── vercel.json        # Vercel deployment configuration
+├── .env.example       # Environment variables template
+└── README.md          # Documentation
 ```
+
+**Note:** In production (Vercel), the app uses Turso cloud database instead of the local `meta_ads.db` file.
 
 ## Database Schema
 
@@ -133,12 +171,16 @@ The Meta Ad Library requires numeric Page IDs, not vanity URLs. The app:
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `APIFY_TOKEN` | Yes* | Apify API token for live scraping |
-| `GEMINI_API_KEY` | Yes* | Google Gemini API key for AI analysis |
+| `TURSO_DATABASE_URL` | Yes (prod) | Turso database URL (e.g., `libsql://your-db.turso.io`) |
+| `TURSO_AUTH_TOKEN` | Yes (prod) | Turso authentication token |
+| `APIFY_TOKEN` | No* | Apify API token for live scraping |
+| `GEMINI_API_KEY` | No* | Google Gemini API key for AI analysis |
 | `META_AD_SCRAPER_ID` | No | Custom Apify actor ID |
-| `PORT` | No | Server port (default: 5000) |
+| `PORT` | No | Server port (default: 3000) |
 
-*App runs in demo mode with mock data if not provided
+**Production Note:** Turso credentials are required when deploying to Vercel or other serverless platforms. For local development, the app will use a local SQLite file if Turso credentials are not provided.
+
+**API Keys:** App runs in demo mode with mock data if APIFY_TOKEN and GEMINI_API_KEY are not provided.
 
 ## Customization
 
