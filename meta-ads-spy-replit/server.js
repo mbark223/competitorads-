@@ -148,8 +148,12 @@ async function initDatabase() {
 // Initialize database and clean up on startup
 async function startup() {
   await initDatabase();
-  await cleanupOrphanedData();
-  setupScheduledScrape();
+
+  // Skip cleanup and cron in serverless environments
+  if (!process.env.VERCEL) {
+    await cleanupOrphanedData();
+    setupScheduledScrape();
+  }
 }
 
 // Clean up orphaned data on startup
@@ -2017,22 +2021,12 @@ app.post('/api/settings/schedule', async (req, res) => {
 // START SERVER
 // ============================================
 
-// Initialize database once
-let dbInitialized = false;
-async function ensureDbInitialized() {
-  if (!dbInitialized) {
-    await startup();
-    dbInitialized = true;
-  }
-}
-
 // For Vercel serverless: export the app
 // For local development: start the server
 if (process.env.VERCEL) {
-  // Vercel serverless - initialize on first request
-  app.use(async (req, res, next) => {
-    await ensureDbInitialized();
-    next();
+  // Vercel serverless - initialize database immediately
+  startup().catch(err => {
+    console.error('Database initialization failed:', err);
   });
   module.exports = app;
 } else {
