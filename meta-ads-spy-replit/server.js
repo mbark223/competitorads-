@@ -2017,15 +2017,36 @@ app.post('/api/settings/schedule', async (req, res) => {
 // START SERVER
 // ============================================
 
-startup().then(() => {
-  app.listen(PORT, () => {
-    console.log(`\n📊 Meta Ad Library Monitor running at http://localhost:${PORT}`);
-    console.log(`🔧 Mode: ${APIFY_TOKEN ? '✅ Live (Apify connected)' : '🔸 Demo (using mock data)'}`);
-    console.log(`🤖 AI: ${GEMINI_API_KEY ? '✅ Gemini connected' : '🔸 Mock analysis'}`);
-    console.log(`💾 Database: ${process.env.TURSO_DATABASE_URL ? '✅ Turso connected' : '🔸 Local file'}`);
-    console.log(`\n💡 Add APIFY_TOKEN, GEMINI_API_KEY, TURSO_DATABASE_URL and TURSO_AUTH_TOKEN to environment variables\n`);
+// Initialize database once
+let dbInitialized = false;
+async function ensureDbInitialized() {
+  if (!dbInitialized) {
+    await startup();
+    dbInitialized = true;
+  }
+}
+
+// For Vercel serverless: export the app
+// For local development: start the server
+if (process.env.VERCEL) {
+  // Vercel serverless - initialize on first request
+  app.use(async (req, res, next) => {
+    await ensureDbInitialized();
+    next();
   });
-}).catch(err => {
-  console.error('Startup failed:', err);
-  process.exit(1);
-});
+  module.exports = app;
+} else {
+  // Local development - start server normally
+  startup().then(() => {
+    app.listen(PORT, () => {
+      console.log(`\n📊 Meta Ad Library Monitor running at http://localhost:${PORT}`);
+      console.log(`🔧 Mode: ${APIFY_TOKEN ? '✅ Live (Apify connected)' : '🔸 Demo (using mock data)'}`);
+      console.log(`🤖 AI: ${GEMINI_API_KEY ? '✅ Gemini connected' : '🔸 Mock analysis'}`);
+      console.log(`💾 Database: ${process.env.TURSO_DATABASE_URL ? '✅ Turso connected' : '🔸 Local file'}`);
+      console.log(`\n💡 Add APIFY_TOKEN, GEMINI_API_KEY, TURSO_DATABASE_URL and TURSO_AUTH_TOKEN to environment variables\n`);
+    });
+  }).catch(err => {
+    console.error('Startup failed:', err);
+    process.exit(1);
+  });
+}
